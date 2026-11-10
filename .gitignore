@@ -63,3 +63,4 @@ output/
 .agents/
 flow_mcp/
 finally.zip
+.tools/

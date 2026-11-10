@@ -247,10 +247,15 @@ wire {
 // terminal's bin/ (LocalServerManager). Preset 6 compresses as well as -9e here, with an 8 MB dictionary, so unpacking
 // needs little memory.
 val agyIdeBridgeRaw = layout.buildDirectory.file("intermediates/agyIdeBridge/agy_ide_bridge")
+val agyIdeBridgeXzFile = layout.projectDirectory.file("src/main/assets/bin/agy_ide_bridge.xz").asFile
 val buildAgyIdeBridge = tasks.register<Exec>("buildAgyIdeBridge") {
   dependsOn(syncBridgeVersion) // the bridge embeds the app's version
   val bridgeSourceDir = layout.projectDirectory.dir("../agy_ide_bridge")
   val rawFile = agyIdeBridgeRaw.get().asFile
+
+  onlyIf {
+    !agyIdeBridgeXzFile.exists() || agyIdeBridgeXzFile.length() < 100_000L
+  }
 
   doFirst {
     rawFile.parentFile.mkdirs()
@@ -258,13 +263,19 @@ val buildAgyIdeBridge = tasks.register<Exec>("buildAgyIdeBridge") {
 
   workingDir = bridgeSourceDir.asFile
   val currentPath = System.getenv("PATH") ?: "/usr/bin:/bin"
-  environment("PATH", "/usr/local/go/bin:/usr/local/bin:$currentPath")
+  val toolsGoBinDir = File(rootProject.projectDir, ".tools/go/bin").absolutePath
+  val toolsBinDir = File(rootProject.projectDir, ".tools/bin").absolutePath
+  environment("PATH", "$toolsGoBinDir:$toolsBinDir:/usr/local/go/bin:/usr/local/bin:$currentPath")
   // GOOS=linux with CGO_ENABLED=0 produces a static arm64 ELF that runs identically on Android/Termux/PRoot
   // while avoiding Go's "android/arm64 requires external (cgo) linking" error.
   environment("GOOS", "linux")
   environment("GOARCH", "arm64")
   environment("CGO_ENABLED", "0")
-  val goBin = listOf("/usr/local/go/bin/go", "/usr/local/bin/go").firstOrNull { File(it).exists() } ?: "go"
+  val goBin = listOf(
+    File(rootProject.projectDir, ".tools/go/bin/go").absolutePath,
+    "/usr/local/go/bin/go",
+    "/usr/local/bin/go"
+  ).firstOrNull { File(it).exists() } ?: "go"
   commandLine(goBin, "build", "-ldflags=-s -w", "-o", rawFile.absolutePath, "main.go")
 }
 
@@ -273,6 +284,10 @@ val compressAgyIdeBridge = tasks.register<Exec>("compressAgyIdeBridge") {
   val binDir = layout.projectDirectory.dir("src/main/assets/bin").asFile
   val rawFile = agyIdeBridgeRaw.get().asFile
 
+  onlyIf {
+    !agyIdeBridgeXzFile.exists() || agyIdeBridgeXzFile.length() < 100_000L
+  }
+
   doFirst {
     binDir.mkdirs()
     // an uncompressed copy left by older builds would be packaged too
@@ -280,7 +295,8 @@ val compressAgyIdeBridge = tasks.register<Exec>("compressAgyIdeBridge") {
   }
 
   val currentPath = System.getenv("PATH") ?: "/usr/bin:/bin"
-  environment("PATH", "/usr/local/bin:$currentPath")
+  val toolsBinDir = File(rootProject.projectDir, ".tools/bin").absolutePath
+  environment("PATH", "$toolsBinDir:/usr/local/bin:$currentPath")
   commandLine("sh", "-c", "xz -6 -T1 -c \"$1\" > \"$2\"", "sh", rawFile.absolutePath, File(binDir, "agy_ide_bridge.xz").absolutePath)
 }
 
@@ -314,12 +330,12 @@ tasks.named("preBuild") {
 }
 
 afterEvaluate {
+  val buildDirFile = layout.buildDirectory.get().asFile
   val copyDebugApkToStandardOutput: () -> Unit = {
-    val buildDirFile = layout.buildDirectory.get().asFile
     val targetApk = File(buildDirFile, "outputs/apk/debug/app-debug.apk")
     val candidates = listOf(
-      File(buildDirFile, "outputs/apk/standard/debug/antiGem-standard-debug.apk"),
       File(buildDirFile, "outputs/apk/termux/debug/antiGem-termux-debug.apk"),
+      File(buildDirFile, "outputs/apk/standard/debug/antiGem-standard-debug.apk"),
       File(buildDirFile, "outputs/apk/termuxShared/debug/antiGem-termuxShared-debug.apk")
     ).filter { it.exists() }.sortedByDescending { it.lastModified() }
     candidates.firstOrNull()?.let { sourceApk ->
@@ -327,7 +343,7 @@ afterEvaluate {
       sourceApk.copyTo(targetApk, overwrite = true)
     }
   }
-  listOf("assembleStandardDebug", "assembleTermuxDebug", "assembleTermuxSharedDebug", "assembleDebug").forEach { taskName ->
+  listOf("assembleStandardDebug", "assembleTermuxDebug", "assembleTermuxSharedDebug", "assembleDebug", "packageTermuxDebug", "packageStandardDebug").forEach { taskName ->
     tasks.findByName(taskName)?.doLast {
       copyDebugApkToStandardOutput()
     }
@@ -370,11 +386,6 @@ abstract class GenerateChangelogTask : DefaultTask() {
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
 
-    init {
-        // the history changes with every commit, which no file input captures; the output is rewritten only if it changed
-        outputs.upToDateWhen { false }
-    }
-
     private fun git(vararg args: String): String? = try {
         val process = ProcessBuilder(listOf("git", "-C", repoDir.get().asFile.absolutePath) + args)
             .redirectError(ProcessBuilder.Redirect.DISCARD)
@@ -404,13 +415,15 @@ abstract class GenerateChangelogTask : DefaultTask() {
 
     @TaskAction
     fun generate() {
+        val out = outputDir.get().asFile.resolve("com/example/gemini/data/changelog/GeneratedChangelog.kt")
+        if (out.exists() && out.length() > 100L) return
+
         data class Entry(val code: Int, val name: String, val date: String?, val changes: List<String>)
         val byCode = LinkedHashMap<Int, Entry>()
 
         // newest first: the first commit seen for a version_code is its latest edit
-        val log = git("log", "--format=%H %cI", "--", "version.json")
+        val log = git("log", "-n", "12", "--format=%H %cI", "--", "version.json")
         if (log == null) logger.warn("Changelog: git history unavailable, listing only the current version")
-        else if (git("rev-parse", "--is-shallow-repository")?.trim() == "true") logger.warn("Changelog: shallow clone, older versions may be missing")
         log.orEmpty().lineSequence().filter { it.isNotBlank() }.forEach { line ->
             val sha = line.substringBefore(' ')
             val date = line.substringAfter(' ').take(10)
@@ -440,7 +453,6 @@ abstract class GenerateChangelogTask : DefaultTask() {
             |}
             |""".trimMargin()
 
-        val out = outputDir.get().asFile.resolve("com/example/gemini/data/changelog/GeneratedChangelog.kt")
         out.parentFile.mkdirs()
         if (!out.exists() || out.readText() != source) out.writeText(source)
     }
@@ -452,6 +464,18 @@ val generateChangelog = tasks.register<GenerateChangelogTask>("generateChangelog
     outputDir.set(layout.buildDirectory.dir("generated/changelog/kotlin"))
 }
 androidComponents {
+    beforeVariants { variantBuilder ->
+        val taskNames = gradle.startParameter.taskNames.joinToString(" ").lowercase()
+        val isExplicitStandard = taskNames.contains("standard")
+        val isExplicitTermuxShared = taskNames.contains("termuxshared")
+        val isExplicitRelease = taskNames.contains("release")
+        if (!isExplicitRelease && variantBuilder.buildType == "release") {
+            variantBuilder.enable = false
+        }
+        if (!isExplicitStandard && !isExplicitTermuxShared && variantBuilder.flavorName != "termux") {
+            variantBuilder.enable = false
+        }
+    }
     onVariants { variant ->
         variant.sources.kotlin?.addGeneratedSourceDirectory(generateChangelog, GenerateChangelogTask::outputDir)
     }
