@@ -79,6 +79,22 @@ jobs:
       - name: Setup Gradle Cache
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Configure Gradle & Kotlin Memory for CI
+        run: |
+          # Remove any low-memory or in-process overrides in gradle.properties and set 5 GB heap for 16 GB ubuntu-latest runners
+          sed -i '/^org\.gradle\.jvmargs=/d' gradle.properties
+          sed -i '/^kotlin\.daemon\.jvmargs=/d' gradle.properties
+          sed -i '/^kotlin\.compiler\.execution\.strategy=/d' gradle.properties
+          sed -i '/^org\.gradle\.workers\.max=/d' gradle.properties
+          cat >> gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx5120m -XX:MaxMetaspaceSize=1024m -XX:+UseG1GC -Dfile.encoding=UTF-8
+          kotlin.daemon.jvmargs=-Xmx5120m -XX:MaxMetaspaceSize=1024m -XX:+UseG1GC
+          kotlin.compiler.execution.strategy=daemon
+          org.gradle.workers.max=2
+          org.gradle.daemon.performance.disable-logging=true
+          EOF
+          tail -n 10 gradle.properties
+
       - name: Read Version Metadata
         id: version
         run: |
@@ -93,8 +109,8 @@ jobs:
           if [ -n "${RELEASE_KEYSTORE_BASE64:-}" ]; then
             echo "Using RELEASE_KEYSTORE_BASE64 secret for release signing..."
             echo "${RELEASE_KEYSTORE_BASE64}" | base64 -d > app/release.jks
-          elif [ -f "debug.keystore" ]; then
-            echo "RELEASE_KEYSTORE_BASE64 not set; generating fallback release.jks for unsigned/CI builds..."
+          else
+            echo "RELEASE_KEYSTORE_BASE64 not set; generating fallback release.jks for CI builds..."
             keytool -genkeypair -v \
               -keystore app/release.jks \
               -alias antigem \
@@ -114,22 +130,30 @@ jobs:
           ./gradlew :app:compressAgyIdeBridge --no-configuration-cache
           ls -lh app/src/main/assets/bin/agy_ide_bridge.xz
 
-      - name: Build Debug APKs (Termux, Standard, TermuxShared)
+      - name: Build Debug APKs Sequentially (Termux, Standard, TermuxShared)
         if: ${{ github.event.inputs.build_mode != 'release' }}
         run: |
           mkdir -p output
-          ./gradlew :app:assembleTermuxDebug :app:assembleStandardDebug :app:assembleTermuxSharedDebug --no-configuration-cache
+          ./gradlew :app:assembleTermuxDebug --max-workers=2 --no-configuration-cache
           find app/build/outputs/apk/termux/debug -name "*.apk" -exec cp {} "output/antiGem-termux-v${{ steps.version.outputs.version_name }}-debug.apk" \;
+
+          ./gradlew :app:assembleStandardDebug --max-workers=2 --no-configuration-cache
           find app/build/outputs/apk/standard/debug -name "*.apk" -exec cp {} "output/antiGem-standard-v${{ steps.version.outputs.version_name }}-debug.apk" \;
+
+          ./gradlew :app:assembleTermuxSharedDebug --max-workers=2 --no-configuration-cache
           find app/build/outputs/apk/termuxShared/debug -name "*.apk" -exec cp {} "output/antiGem-termux-shared-v${{ steps.version.outputs.version_name }}-debug.apk" \;
 
-      - name: Build Release APKs (Termux, Standard, TermuxShared)
+      - name: Build Release APKs Sequentially (Termux, Standard, TermuxShared)
         if: ${{ github.event.inputs.build_mode != 'debug' }}
         run: |
           mkdir -p output
-          ./gradlew :app:assembleTermuxRelease :app:assembleStandardRelease :app:assembleTermuxSharedRelease --no-configuration-cache
+          ./gradlew :app:assembleTermuxRelease --max-workers=2 --no-configuration-cache
           find app/build/outputs/apk/termux/release -name "*.apk" -exec cp {} "output/antiGem-termux-v${{ steps.version.outputs.version_name }}-release.apk" \;
+
+          ./gradlew :app:assembleStandardRelease --max-workers=2 --no-configuration-cache
           find app/build/outputs/apk/standard/release -name "*.apk" -exec cp {} "output/antiGem-standard-v${{ steps.version.outputs.version_name }}-release.apk" \;
+
+          ./gradlew :app:assembleTermuxSharedRelease --max-workers=2 --no-configuration-cache
           find app/build/outputs/apk/termuxShared/release -name "*.apk" -exec cp {} "output/antiGem-termux-shared-v${{ steps.version.outputs.version_name }}-release.apk" \;
 
       - name: Copy Bridge Binary & Generate SHA-256 Checksums
