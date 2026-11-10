@@ -55,9 +55,15 @@ func (h *Handler) ServerInfoHandler(w http.ResponseWriter, r *http.Request) {
 	if h.HubManager != nil {
 		hubPort = h.HubManager.HubPort
 	}
+	osName := runtime.GOOS
+	if h.Cfg != nil && osName == "linux" {
+		if _, err := os.Stat("/system/bin/linker64"); err == nil || strings.HasPrefix(h.Cfg.HomeDir, "/data/") {
+			osName = "android"
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"version":      buildinfo.Version(),
-		"os":           runtime.GOOS,
+		"os":           osName,
 		"arch":         runtime.GOARCH,
 		"hostname":     hostname,
 		"pid":          os.Getpid(),

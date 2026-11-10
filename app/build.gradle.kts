@@ -253,9 +253,8 @@ val buildAgyIdeBridge = tasks.register<Exec>("buildAgyIdeBridge") {
   val bridgeSourceDir = layout.projectDirectory.dir("../agy_ide_bridge")
   val rawFile = agyIdeBridgeRaw.get().asFile
 
-  onlyIf {
-    !agyIdeBridgeXzFile.exists() || agyIdeBridgeXzFile.length() < 100_000L
-  }
+  inputs.dir(bridgeSourceDir)
+  outputs.file(rawFile)
 
   doFirst {
     rawFile.parentFile.mkdirs()
@@ -284,9 +283,8 @@ val compressAgyIdeBridge = tasks.register<Exec>("compressAgyIdeBridge") {
   val binDir = layout.projectDirectory.dir("src/main/assets/bin").asFile
   val rawFile = agyIdeBridgeRaw.get().asFile
 
-  onlyIf {
-    !agyIdeBridgeXzFile.exists() || agyIdeBridgeXzFile.length() < 100_000L
-  }
+  inputs.file(rawFile)
+  outputs.file(agyIdeBridgeXzFile)
 
   doFirst {
     binDir.mkdirs()

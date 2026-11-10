@@ -3,6 +3,7 @@ package hub
 import (
 	"bufio"
 	"context"
+	"debug/elf"
 	"errors"
 	"fmt"
 	"io"
@@ -74,8 +75,86 @@ type HubManager struct {
 	agyBinShadow atomic.Value
 }
 
+// IsLegacyAgyWrapper reports whether path is an old shell wrapper script written by earlier versions of the app
+// before agy was actually installed.
+func IsLegacyAgyWrapper(path string) bool {
+	if path == "" {
+		return false
+	}
+	fi, err := os.Stat(path)
+	if err != nil || fi.IsDir() || fi.Size() > 8192 {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 4096)
+	n, _ := f.Read(buf)
+	content := string(buf[:n])
+	return strings.Contains(content, "Antigravity (agy) launcher written by AntiGem")
+}
+
+// CleanupLegacyAgyWrappers removes any dummy wrapper scripts created by older app builds and restores ~/.local/bin/agy.real
+// back to ~/.local/bin/agy if present.
+func CleanupLegacyAgyWrappers() {
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		localBin := filepath.Join(home, ".local", "bin")
+		realFile := filepath.Join(localBin, "agy.real")
+		agyFile := filepath.Join(localBin, "agy")
+		if fi, err := os.Stat(realFile); err == nil && !fi.IsDir() {
+			if _, err2 := os.Stat(agyFile); err2 != nil || IsLegacyAgyWrapper(agyFile) {
+				_ = os.Remove(agyFile)
+				_ = os.Rename(realFile, agyFile)
+				_ = os.Chmod(agyFile, 0o755)
+			}
+		}
+	}
+	var wrapperCandidates []string
+	if home != "" {
+		wrapperCandidates = append(wrapperCandidates,
+			filepath.Join(home, ".local", "bin", "agy"),
+			filepath.Join(home, "..", "usr", "bin", "agy"),
+		)
+	}
+	if prefix := os.Getenv("PREFIX"); prefix != "" {
+		wrapperCandidates = append(wrapperCandidates, filepath.Join(prefix, "bin", "agy"))
+	}
+	wrapperCandidates = append(wrapperCandidates,
+		"/data/data/com.termux/files/usr/bin/agy",
+		"/data/data/com.antigem/files/usr/bin/agy",
+	)
+	for _, p := range wrapperCandidates {
+		if IsLegacyAgyWrapper(p) {
+			_ = os.Remove(p)
+		}
+	}
+}
+
+// GlibcInterp reports whether bin is an ELF executable whose PT_INTERP requests a glibc dynamic linker (ld-linux*).
+// Native Android Bionic executables use /system/bin/linker64 and must NOT be launched via glibc's ld-linux.
+func GlibcInterp(bin string) bool {
+	f, err := elf.Open(bin)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	for _, p := range f.Progs {
+		if p.Type == elf.PT_INTERP {
+			buf := make([]byte, p.Filesz)
+			if _, err := p.ReadAt(buf, 0); err == nil {
+				return strings.Contains(string(buf), "ld-linux")
+			}
+		}
+	}
+	return false
+}
+
 // FindAllAgyBinaries discovers all existing AGY binaries in candidate paths and PATH.
 func FindAllAgyBinaries() []string {
+	CleanupLegacyAgyWrappers()
 	home, _ := os.UserHomeDir()
 	var rawCandidates []string
 	if home != "" {
@@ -119,7 +198,7 @@ func FindAllAgyBinaries() []string {
 		if seen[absPath] {
 			continue
 		}
-		if fi, err := os.Stat(absPath); err == nil && !fi.IsDir() {
+		if fi, err := os.Stat(absPath); err == nil && !fi.IsDir() && !IsLegacyAgyWrapper(absPath) {
 			seen[absPath] = true
 			results = append(results, absPath)
 		}
@@ -491,6 +570,8 @@ func (m *HubManager) Start() error {
 
 	m.setStatusLocked(HubStatusStarting, "")
 
+	CleanupLegacyAgyWrappers()
+
 	if m.AgyBinPath == "" {
 		if bins := FindAllAgyBinaries(); len(bins) > 0 {
 			m.AgyBinPath = bins[0]
@@ -503,7 +584,7 @@ func (m *HubManager) Start() error {
 		}
 	}
 	// the app names the agy to use even before it is installed (Settings → Antigravity CLI → Install)
-	if fi, statErr := os.Stat(m.AgyBinPath); statErr != nil || fi.IsDir() {
+	if fi, statErr := os.Stat(m.AgyBinPath); statErr != nil || fi.IsDir() || IsLegacyAgyWrapper(m.AgyBinPath) {
 		if bins := FindAllAgyBinaries(); len(bins) > 0 {
 			log.Printf("[Hub] Configured AGY path %s not found; auto-switched to discovered binary %s", m.AgyBinPath, bins[0])
 			m.AgyBinPath = bins[0]
@@ -566,28 +647,22 @@ func (m *HubManager) Start() error {
 		usrBin = filepath.Join(prefix, "bin")
 	}
 
-	// On Termux (where /lib/ld-linux-aarch64.so.1 does not exist), if AgyBinPath is a raw ELF binary,
-	// run it through the bundled glibc loader ($PREFIX/glibc/lib/ld-linux-aarch64.so.1) automatically.
+	// On Termux (where /lib/ld-linux-aarch64.so.1 does not exist), only run AgyBinPath through the bundled glibc
+	// loader if its ELF PT_INTERP actually asks for glibc (ld-linux*). Native Android Bionic builds of agy
+	// (PT_INTERP = /system/bin/linker64) must be executed directly.
 	var cmd *exec.Cmd
 	usedGlibcLoader := false
-	if _, sysLoaderErr := os.Stat("/lib/ld-linux-aarch64.so.1"); sysLoaderErr != nil {
+	if _, sysLoaderErr := os.Stat("/lib/ld-linux-aarch64.so.1"); sysLoaderErr != nil && GlibcInterp(m.AgyBinPath) {
 		glibcBase := filepath.Join(home, "..", "usr", "glibc", "lib")
 		if prefix != "" {
 			glibcBase = filepath.Join(prefix, "glibc", "lib")
 		}
 		glibcLoader := filepath.Join(glibcBase, "ld-linux-aarch64.so.1")
 		if st, err := os.Stat(glibcLoader); err == nil && !st.IsDir() {
-			if f, err := os.Open(m.AgyBinPath); err == nil {
-				var magic [4]byte
-				_, _ = io.ReadFull(f, magic[:])
-				_ = f.Close()
-				if magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F' {
-					loaderArgs := append([]string{"--library-path", glibcBase, m.AgyBinPath}, args...)
-					cmd = exec.CommandContext(ctx, glibcLoader, loaderArgs...)
-					usedGlibcLoader = true
-					log.Printf("[Hub] Launching ELF %s via Termux glibc loader %s", m.AgyBinPath, glibcLoader)
-				}
-			}
+			loaderArgs := append([]string{"--library-path", glibcBase, m.AgyBinPath}, args...)
+			cmd = exec.CommandContext(ctx, glibcLoader, loaderArgs...)
+			usedGlibcLoader = true
+			log.Printf("[Hub] Launching glibc ELF %s via Termux glibc loader %s", m.AgyBinPath, glibcLoader)
 		}
 	}
 
@@ -597,12 +672,23 @@ func (m *HubManager) Start() error {
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	baseEnv := make([]string, 0, len(os.Environ())+12)
+	baseEnv := make([]string, 0, len(os.Environ())+14)
+	hasTmp := false
 	for _, kv := range os.Environ() {
 		if usedGlibcLoader && strings.HasPrefix(kv, "LD_PRELOAD=") {
 			continue // Never preload bionic libtermux-exec.so into a glibc process
 		}
+		if strings.HasPrefix(kv, "TMPDIR=") && len(kv) > len("TMPDIR=") {
+			hasTmp = true
+		}
 		baseEnv = append(baseEnv, kv)
+	}
+	if !hasTmp {
+		if tPrefix := config.TermuxPrefix(home); tPrefix != "" {
+			tmpDir := filepath.Join(tPrefix, "tmp")
+			_ = os.MkdirAll(tmpDir, 0o700)
+			baseEnv = append(baseEnv, "TMPDIR="+tmpDir)
+		}
 	}
 
 	cmd.Env = append(baseEnv,

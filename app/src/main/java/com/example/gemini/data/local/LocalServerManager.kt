@@ -106,6 +106,20 @@ object LocalServerManager {
 
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val lastSavedUpdate = prefs.getLong(KEY_BRIDGE_LAST_UPDATE_TIME, 0L)
+        val lastSavedAssetSize = prefs.getLong("bridge_asset_size", -1L)
+        val currentAssetSize = try {
+            context.assets.open("bin/$BRIDGE_ASSET").use { s ->
+                var total = 0L
+                val buf = ByteArray(16 * 1024)
+                var r: Int
+                while (s.read(buf).also { r = it } != -1) {
+                    total += r
+                }
+                total
+            }
+        } catch (_: Exception) {
+            0L
+        }
         val packageInfo = try {
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
                 context.packageManager.getPackageInfo(
@@ -122,7 +136,16 @@ object LocalServerManager {
         val currentAppUpdateTime = packageInfo?.lastUpdateTime ?: 0L
 
         val needsCopy =
-            !bridgeFile.exists() || !backupFile.exists() || !backupChatsFile.exists() || !restoreChatsFile.exists() || !backupProjectsFile.exists() || !restoreProjectsFile.exists() || !backupProotUbuntuFile.exists() || !gitCloneFile.exists() || (currentAppUpdateTime > 0L && currentAppUpdateTime != lastSavedUpdate)
+            !bridgeFile.exists() ||
+                !backupFile.exists() ||
+                !backupChatsFile.exists() ||
+                !restoreChatsFile.exists() ||
+                !backupProjectsFile.exists() ||
+                !restoreProjectsFile.exists() ||
+                !backupProotUbuntuFile.exists() ||
+                !gitCloneFile.exists() ||
+                (currentAppUpdateTime > 0L && currentAppUpdateTime != lastSavedUpdate) ||
+                (currentAssetSize > 0L && currentAssetSize != lastSavedAssetSize)
 
         if (needsCopy) {
             try {
@@ -169,9 +192,14 @@ object LocalServerManager {
                 // Also copy agy_ide_bridge to public Downloads folder for user access
                 saveBridgeToDownloads(context)
 
-                if (currentAppUpdateTime > 0L) {
-                    prefs.edit().putLong(KEY_BRIDGE_LAST_UPDATE_TIME, currentAppUpdateTime).apply()
-                }
+                prefs.edit().apply {
+                    if (currentAppUpdateTime > 0L) {
+                        putLong(KEY_BRIDGE_LAST_UPDATE_TIME, currentAppUpdateTime)
+                    }
+                    if (currentAssetSize > 0L) {
+                        putLong("bridge_asset_size", currentAssetSize)
+                    }
+                }.apply()
                 Log.d(TAG, "[ServerManager] Successfully extracted assets to ${binDir.absolutePath}")
             } catch (e: Exception) {
                 Log.e(TAG, "[ServerManager] Failed to extract assets from bin/", e)

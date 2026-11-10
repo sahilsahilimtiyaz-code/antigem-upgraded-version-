@@ -6,6 +6,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.WindowInsets
@@ -14,6 +17,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.toArgb
@@ -33,6 +37,33 @@ enum class AppViewMode {
     BROWSER,
     NOTES,
     FILES
+}
+
+/**
+ * Smooth 120Hz transition for persistent full-screen layers (Chat, IDE, Terminal, Browser, Notes, Files).
+ * Animates alpha, subtle horizontal slide, and subtle scale while keeping inactive views parked offscreen
+ * once fully faded out so WebViews/terminals retain state without intercepting touches.
+ */
+private fun Modifier.persistentScreenTransition(isVisible: Boolean, slideDirection: Float = 1f): Modifier = composed {
+    val progress by animateFloatAsState(
+        targetValue = if (isVisible) 1f else 0f,
+        animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
+        label = "screen_transition"
+    )
+    this.graphicsLayer {
+        alpha = progress
+        if (progress <= 0.005f) {
+            translationX = 20000f * slideDirection
+            scaleX = 0.985f
+            scaleY = 0.985f
+        } else {
+            val offsetPx = 24f * density * (1f - progress) * slideDirection
+            translationX = offsetPx
+            val scale = 0.985f + (0.015f * progress)
+            scaleX = scale
+            scaleY = scale
+        }
+    }
 }
 
 class MainActivity : ComponentActivity() {
@@ -312,11 +343,10 @@ class MainActivity : ComponentActivity() {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxSize()
-                                        .graphicsLayer {
-                                            val isVisible = currentViewMode == AppViewMode.CHAT
-                                            alpha = if (isVisible) 1f else 0f
-                                            translationX = if (isVisible) 0f else -20000f
-                                        }
+                                        .persistentScreenTransition(
+                                            isVisible = currentViewMode == AppViewMode.CHAT,
+                                            slideDirection = -1f
+                                        )
                                 ) {
                                     ChatScreen(
                                         viewModel = chatViewModel,
@@ -347,11 +377,10 @@ class MainActivity : ComponentActivity() {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxSize()
-                                        .graphicsLayer {
-                                            val isVisible = currentViewMode == AppViewMode.IDE
-                                            alpha = if (isVisible) 1f else 0f
-                                            translationX = if (isVisible) 0f else 20000f
-                                        }
+                                        .persistentScreenTransition(
+                                            isVisible = currentViewMode == AppViewMode.IDE,
+                                            slideDirection = 1f
+                                        )
                                 ) {
                                     IdeScreen(
                                         viewModel = chatViewModel,
@@ -378,11 +407,10 @@ class MainActivity : ComponentActivity() {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxSize()
-                                        .graphicsLayer {
-                                            val isVisible = currentViewMode == AppViewMode.TERMINAL
-                                            alpha = if (isVisible) 1f else 0f
-                                            translationX = if (isVisible) 0f else 20000f
-                                        }
+                                        .persistentScreenTransition(
+                                            isVisible = currentViewMode == AppViewMode.TERMINAL,
+                                            slideDirection = 1f
+                                        )
                                 ) {
                                     if (currentViewMode == AppViewMode.TERMINAL || (hasEverOpenedTerminal && terminalSessions.isNotEmpty())) {
                                         com.example.gemini.ui.components.LocalTerminalContent(
@@ -398,11 +426,10 @@ class MainActivity : ComponentActivity() {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxSize()
-                                        .graphicsLayer {
-                                            val isVisible = currentViewMode == AppViewMode.BROWSER
-                                            alpha = if (isVisible) 1f else 0f
-                                            translationX = if (isVisible) 0f else 20000f
-                                        }
+                                        .persistentScreenTransition(
+                                            isVisible = currentViewMode == AppViewMode.BROWSER,
+                                            slideDirection = 1f
+                                        )
                                 ) {
                                     BrowserScreen(
                                         isVisible = currentViewMode == AppViewMode.BROWSER,
@@ -417,11 +444,10 @@ class MainActivity : ComponentActivity() {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxSize()
-                                        .graphicsLayer {
-                                            val isVisible = currentViewMode == AppViewMode.NOTES
-                                            alpha = if (isVisible) 1f else 0f
-                                            translationX = if (isVisible) 0f else 20000f
-                                        }
+                                        .persistentScreenTransition(
+                                            isVisible = currentViewMode == AppViewMode.NOTES,
+                                            slideDirection = 1f
+                                        )
                                 ) {
                                     com.example.gemini.ui.notes.NotesScreen(
                                         isVisible = currentViewMode == AppViewMode.NOTES,
@@ -438,11 +464,10 @@ class MainActivity : ComponentActivity() {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxSize()
-                                        .graphicsLayer {
-                                            val isVisible = currentViewMode == AppViewMode.FILES
-                                            alpha = if (isVisible) 1f else 0f
-                                            translationX = if (isVisible) 0f else 20000f
-                                        }
+                                        .persistentScreenTransition(
+                                            isVisible = currentViewMode == AppViewMode.FILES,
+                                            slideDirection = 1f
+                                        )
                                 ) {
                                     if (hasEverOpenedFiles) {
                                         com.example.gemini.ui.files.FileExplorer(

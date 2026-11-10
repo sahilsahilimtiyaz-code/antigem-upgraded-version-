@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gemini-server/pkg/config"
 )
 
 // Installing OpenCode from the app. The official v2 installer (https://opencode.ai/v2/install) downloads the npm
@@ -75,7 +77,7 @@ func installTarget() (string, error) {
 			target += "-baseline"
 		}
 	}
-	if runtime.GOOS == "linux" {
+	if runtime.GOOS == "linux" && !config.IsAndroid() {
 		if _, err := os.Stat("/etc/alpine-release"); err == nil {
 			target += "-musl"
 		} else if out, err := exec.Command("ldd", "--version").CombinedOutput(); err == nil || len(out) > 0 {

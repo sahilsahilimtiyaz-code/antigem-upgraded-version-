@@ -509,6 +509,22 @@ fun ChatScreen(
         com.example.gemini.ui.components.AppToastHelper.showToast("Checking Claude Code…", com.example.gemini.ui.components.ChatToastType.INFO)
         viewModel.claudeAccount.refreshStatus()
     }
+    val agyCli by com.example.gemini.data.remote.BridgeInfo.agyCli.collectAsState()
+    val agyCliJob by com.example.gemini.data.remote.BridgeInfo.job.collectAsState()
+    LaunchedEffect(systemConnectionState) {
+        if (systemConnectionState is com.example.gemini.data.remote.SystemConnectionState.Connected ||
+            systemConnectionState.status != com.example.gemini.data.remote.SystemStatus.OFFLINE
+        ) {
+            com.example.gemini.data.remote.BridgeInfo.refreshAgyCli()
+        }
+    }
+    val openAgyCliSetup = {
+        if (agyCliJob?.running != true && agyCli?.installed != true) {
+            com.example.gemini.data.remote.BridgeInfo.installAgy()
+        }
+        requestedSettingsSection = com.example.gemini.ui.settings.SettingsSection.AGY_CLI
+        showSettingsDialog = true
+    }
     val agyEntry = if (com.example.gemini.domain.model.AgentKind.AGY in enabledAgents) {
         com.example.gemini.ui.agents.agyStatusEntry(
             state = systemConnectionState,
@@ -516,10 +532,14 @@ fun ChatScreen(
             isAuthBusy = isAuthBusy,
             inStartupGrace = isInitialGracePeriod,
             serverRestarting = serverRestarting,
+            agyInstalled = agyCli?.installed,
+            agyInstalling = agyCliJob?.running == true,
+            onSetup = openAgyCliSetup,
             onSignIn = { viewModel.loginToAgyHub(force = true) },
             onCheckAuth = { viewModel.checkAgyAuthStatus(userInitiated = true) },
             onRetry = {
                 com.example.gemini.ui.components.AppToastHelper.showToast("Reconnecting to Antigravity…", com.example.gemini.ui.components.ChatToastType.INFO)
+                com.example.gemini.data.remote.BridgeInfo.refreshAgyCli()
                 viewModel.retryConnections()
             },
             onRestartServer = restartLocalServer
@@ -2043,6 +2063,22 @@ fun ChatScreen(
                                         com.example.gemini.ui.jarvis.JarvisChatWelcome { example ->
                                             inputState.setTextAndPlaceCursorAtEnd(example)
                                         }
+                                    } else if (!isClaudeChat && !isOpenCodeChat && !isCodexChat && agyEntry != null && !agyEntry.isReady) {
+                                        com.example.gemini.ui.agents.AgentSetupPrompt(
+                                            agent = com.example.gemini.domain.model.AgentKind.AGY,
+                                            title = when {
+                                                agyCliJob?.running == true -> "Installing Antigravity CLI…"
+                                                agyEntry.label == "Not installed" -> "Antigravity is not installed"
+                                                agyEntry.pending -> "Starting Antigravity…"
+                                                else -> "Antigravity is unavailable"
+                                            },
+                                            message = agyEntry.detail ?: agyEntry.label,
+                                            statusColor = agyEntry.color,
+                                            actionLabel = agyEntry.action?.label,
+                                            onAction = { agyEntry.action?.onClick?.invoke() },
+                                            secondaryLabel = if (agyEntry.pending) null else "Server logs",
+                                            onSecondary = { showLocalServerOutputDialog = true }
+                                        )
                                     } else {
                                         Text(
                                             text = "How can I help you today?",

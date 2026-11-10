@@ -31,6 +31,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"gemini-server/pkg/config"
 )
 
 // startTimeout: how long a cold `opencode serve` may take to answer (it is a ~250 MB Bun binary; a phone is slow).
@@ -115,13 +117,7 @@ func (m *Manager) ResolveBinary() (string, error) {
 
 // termuxPrefix is Termux's $PREFIX (…/files/usr), or "" when not on Android.
 func (m *Manager) termuxPrefix() string {
-	if runtime.GOOS != "android" {
-		return ""
-	}
-	if p := os.Getenv("PREFIX"); p != "" {
-		return p
-	}
-	return filepath.Join(filepath.Dir(m.HomeDir), "usr")
+	return config.TermuxPrefix(m.HomeDir)
 }
 
 // glibcInterp reports whether bin is an ELF executable that asks for the glibc loader (the official Linux build).

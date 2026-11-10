@@ -80,18 +80,37 @@ fun agyStatusEntry(
     isAuthBusy: Boolean,
     inStartupGrace: Boolean,
     serverRestarting: Boolean,
+    agyInstalled: Boolean? = null,
+    agyInstalling: Boolean = false,
+    onSetup: () -> Unit = {},
     onSignIn: () -> Unit,
     onCheckAuth: () -> Unit,
     onRetry: () -> Unit,
     onRestartServer: () -> Unit
 ): AgentStatusEntry {
     val status = state.status
+    val errText = (state as? SystemConnectionState.Connected)?.error ?: (state as? SystemConnectionState.Error)?.message
+    val missingBinary = agyInstalled == false ||
+        (errText != null && (errText.contains("not installed", ignoreCase = true) || errText.contains("not specified or found", ignoreCase = true)))
     fun entry(label: String, color: Color = status.dotColor, detail: String? = null, action: AgentStatusAction? = null, pending: Boolean = false) =
         AgentStatusEntry(AgentKind.AGY, label, color, detail, action, pending, isReady = status == SystemStatus.READY && !isAuthBusy)
     return when {
         serverRestarting -> entry("Restarting…", SystemStatus.STARTING.dotColor, "The local server is restarting.", pending = true)
+        agyInstalling -> entry(
+            "Installing…",
+            SystemStatus.STARTING.dotColor,
+            "Downloading and installing the Antigravity CLI (agy)…",
+            AgentStatusAction("Progress", onSetup),
+            pending = true
+        )
         isAuthBusy -> entry("Signing in…", SystemStatus.ACQUIRING_CSRF.dotColor, "Finish signing in with Google in your browser.", AgentStatusAction("Check", onCheckAuth), pending = true)
         status == SystemStatus.OFFLINE && inStartupGrace -> entry("Starting…", SystemStatus.STARTING.dotColor, "Starting the local server.", pending = true)
+        missingBinary && (state is SystemConnectionState.Connected || status == SystemStatus.ERROR) -> entry(
+            "Not installed",
+            ClaudeStatus.NOT_INSTALLED.dotColor,
+            "Antigravity CLI (agy) is not installed yet. The app can install it for you.",
+            AgentStatusAction("Install", onSetup)
+        )
         status == SystemStatus.OFFLINE && state is SystemConnectionState.Connected -> entry(
             "Offline",
             detail = "The Antigravity hub is stopped.",
@@ -117,7 +136,7 @@ fun agyStatusEntry(
         )
         else -> entry(
             "Error",
-            detail = (state as? SystemConnectionState.Connected)?.error ?: (state as? SystemConnectionState.Error)?.message,
+            detail = errText,
             action = if (state is SystemConnectionState.Connected) AgentStatusAction("Restart", onRestartServer) else AgentStatusAction("Retry", onRetry)
         )
     }
@@ -462,7 +481,7 @@ fun AgentStatusMenu(
     }
 }
 
-/** Centered prompt for an agent that is not ready (empty chat screen). */
+/** Centered prompt card for an agent that is not ready (empty chat screen). */
 @Composable
 fun AgentSetupPrompt(
     agent: AgentKind,
@@ -476,33 +495,51 @@ fun AgentSetupPrompt(
     onSecondary: () -> Unit = {}
 ) {
     val accent = agent.accent()
-    Column(
-        modifier.fillMaxWidth().padding(horizontal = 24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 24.dp),
+        shape = RoundedCornerShape(22.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.22f)),
+        tonalElevation = 4.dp
     ) {
-        AgentMark(agent, size = 60.dp, statusColor = statusColor)
-        Spacer(Modifier.height(16.dp))
-        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-        Spacer(Modifier.height(8.dp))
-        Text(
-            message,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
-            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-            lineHeight = 20.sp
-        )
-        if (actionLabel != null) {
-            Spacer(Modifier.height(20.dp))
-            androidx.compose.material3.Button(
-                onClick = onAction,
-                shape = RoundedCornerShape(12.dp),
-                colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = accent, contentColor = Color.White),
-                contentPadding = PaddingValues(horizontal = 24.dp, vertical = 10.dp)
-            ) { Text(actionLabel, fontSize = 14.sp, fontWeight = FontWeight.Medium) }
-        }
-        if (secondaryLabel != null) {
-            androidx.compose.material3.TextButton(onClick = onSecondary) {
-                Text(secondaryLabel, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f))
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 26.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            AgentMark(agent, size = 62.dp, statusColor = statusColor)
+            Spacer(Modifier.height(16.dp))
+            Text(
+                title,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                lineHeight = 20.sp
+            )
+            if (actionLabel != null) {
+                Spacer(Modifier.height(20.dp))
+                androidx.compose.material3.Button(
+                    onClick = onAction,
+                    shape = RoundedCornerShape(14.dp),
+                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = accent, contentColor = Color.White),
+                    contentPadding = PaddingValues(horizontal = 26.dp, vertical = 11.dp)
+                ) { Text(actionLabel, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
+            }
+            if (secondaryLabel != null) {
+                Spacer(Modifier.height(4.dp))
+                androidx.compose.material3.TextButton(onClick = onSecondary) {
+                    Text(secondaryLabel, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f))
+                }
             }
         }
     }

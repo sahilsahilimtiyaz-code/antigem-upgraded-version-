@@ -91,8 +91,8 @@ object LocalEnvironmentManager {
         .build()
 
     /**
-     * High-speed downloader supporting 4x parallel HTTP Range connections for large archives (>= 4 MB)
-     * with seamless fallback to a 256 KB buffered single stream.
+     * High-throughput 256 KB buffered downloader with automatic HTTP Range resume on transient network drops.
+     * Avoids opening parallel range sockets before redirect resolution so GitHub signed asset URLs never fail or corrupt.
      */
     private suspend fun downloadFileFast(
         url: String,
@@ -102,139 +102,79 @@ object LocalEnvironmentManager {
     ): Boolean = withContext(Dispatchers.IO) {
         val userAgent = "GeminiApp-LocalTerminal/${Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64"}"
         val startTime = System.currentTimeMillis()
-        var lastProgressUpdate = startTime
+        var lastUpdate = startTime
+        if (destFile.exists()) destFile.delete()
 
-        // 1. Probe range support & final URL via a 1-byte range request
-        var resolvedUrl = url
-        var totalSize = -1L
-        var supportsRanges = false
-        try {
-            val probeReq = Request.Builder()
+        var expectedTotal = fallbackExpectedBytes
+        val maxAttempts = 3
+        var lastException: Exception? = null
+
+        for (attempt in 1..maxAttempts) {
+            ensureActive()
+            val existingBytes = if (destFile.exists()) destFile.length() else 0L
+            val reqBuilder = Request.Builder()
                 .url(url)
                 .header("User-Agent", userAgent)
-                .header("Range", "bytes=0-0")
-                .build()
-            httpClient.newCall(probeReq).execute().use { resp ->
-                resolvedUrl = resp.request.url.toString()
-                if (resp.code == 206) {
-                    val contentRange = resp.header("Content-Range") // e.g. "bytes 0-0/36700160"
-                    val slashIdx = contentRange?.lastIndexOf('/') ?: -1
-                    if (slashIdx != -1 && contentRange != null) {
-                        totalSize = contentRange.substring(slashIdx + 1).trim().toLongOrNull() ?: -1L
-                    }
-                    if (totalSize >= 4 * 1024 * 1024L) {
-                        supportsRanges = true
-                    }
-                } else if (resp.isSuccessful) {
-                    totalSize = resp.body?.contentLength() ?: -1L
-                }
+                .header("Accept", "*/*")
+            if (existingBytes > 0L) {
+                reqBuilder.header("Range", "bytes=$existingBytes-")
             }
-        } catch (e: Exception) {
-            Log.d(TAG, "Range probe skipped for $url: ${e.message}")
-        }
 
-        // 2. Attempt 4-connection parallel Range download when supported
-        if (supportsRanges && totalSize >= 4 * 1024 * 1024L) {
             try {
-                if (destFile.exists()) destFile.delete()
-                RandomAccessFile(destFile, "rw").use { raf ->
-                    raf.setLength(totalSize)
-                }
-                val numChunks = 4
-                val chunkSize = totalSize / numChunks
-                val downloadedBytes = java.util.concurrent.atomic.AtomicLong(0L)
-                val progressLock = Any()
+                httpClient.newCall(reqBuilder.build()).execute().use { response ->
+                    if (!response.isSuccessful && response.code != 206) {
+                        if (existingBytes > 0L && response.code == 416) {
+                            return@withContext true
+                        }
+                        throw IOException("HTTP ${response.code} from server")
+                    }
+                    val body = response.body ?: throw IOException("Empty response body")
+                    val isResume = response.code == 206 && existingBytes > 0L
+                    val contentLength = body.contentLength()
+                    if (contentLength > 0L) {
+                        expectedTotal = if (isResume) existingBytes + contentLength else contentLength
+                    }
 
-                val allChunksOk = coroutineScope {
-                    (0 until numChunks).map { index ->
-                        async(Dispatchers.IO) {
-                            val startByte = index * chunkSize
-                            val endByte = if (index == numChunks - 1) totalSize - 1 else (startByte + chunkSize - 1)
-                            val rangeReq = Request.Builder()
-                                .url(resolvedUrl)
-                                .header("User-Agent", userAgent)
-                                .header("Range", "bytes=$startByte-$endByte")
-                                .build()
-                            httpClient.newCall(rangeReq).execute().use { response ->
-                                if (response.code != 206) return@use false
-                                val body = response.body ?: return@use false
-                                RandomAccessFile(destFile, "rw").use { raf ->
-                                    raf.seek(startByte)
-                                    val buffer = ByteArray(256 * 1024)
-                                    body.byteStream().use { inStream ->
-                                        var read: Int
-                                        while (inStream.read(buffer).also { read = it } != -1) {
-                                            ensureActive()
-                                            raf.write(buffer, 0, read)
-                                            val currentTotal = downloadedBytes.addAndGet(read.toLong())
-                                            val now = System.currentTimeMillis()
-                                            if (now - lastProgressUpdate > 120) {
-                                                synchronized(progressLock) {
-                                                    if (now - lastProgressUpdate > 120) {
-                                                        lastProgressUpdate = now
-                                                        val elapsedSec = ((now - startTime) / 1000.0).coerceAtLeast(0.05)
-                                                        val speed = (currentTotal / elapsedSec).toLong()
-                                                        onProgress(currentTotal, totalSize, speed, true)
-                                                    }
-                                                }
-                                            }
-                                        }
+                    var bytesReadTotal = if (isResume) existingBytes else 0L
+                    val buffer = ByteArray(256 * 1024)
+                    FileOutputStream(destFile, isResume).use { fos ->
+                        BufferedOutputStream(fos, 256 * 1024).use { outStream ->
+                            body.byteStream().use { inStream ->
+                                var read: Int
+                                while (inStream.read(buffer).also { read = it } != -1) {
+                                    ensureActive()
+                                    outStream.write(buffer, 0, read)
+                                    bytesReadTotal += read
+                                    val now = System.currentTimeMillis()
+                                    if (now - lastUpdate > 120) {
+                                        lastUpdate = now
+                                        val elapsedSec = ((now - startTime) / 1000.0).coerceAtLeast(0.05)
+                                        val speed = (bytesReadTotal / elapsedSec).toLong()
+                                        onProgress(bytesReadTotal, expectedTotal.coerceAtLeast(bytesReadTotal), speed, false)
                                     }
                                 }
-                                true
+                                outStream.flush()
                             }
                         }
-                    }.awaitAll().all { it }
-                }
-
-                if (allChunksOk && destFile.exists() && destFile.length() == totalSize) {
+                        try {
+                            fos.fd.sync()
+                        } catch (_: Exception) {}
+                    }
                     val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.05)
-                    onProgress(totalSize, totalSize, (totalSize / elapsedSec).toLong(), true)
+                    onProgress(bytesReadTotal, expectedTotal.coerceAtLeast(bytesReadTotal), (bytesReadTotal / elapsedSec).toLong(), false)
                     return@withContext true
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
-                Log.w(TAG, "Parallel range download fallback to single stream: ${e.message}")
-            }
-        }
-
-        // 3. High-throughput 256 KB buffered single-stream download
-        if (destFile.exists()) destFile.delete()
-        val request = Request.Builder()
-            .url(url)
-            .header("User-Agent", userAgent)
-            .build()
-        httpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw IOException("HTTP ${response.code} from server")
-            }
-            val body = response.body ?: throw IOException("Empty response body")
-            val contentLength = body.contentLength()
-            val expectedTotal = if (contentLength > 0) contentLength else fallbackExpectedBytes
-            var bytesReadTotal = 0L
-            val singleStartTime = System.currentTimeMillis()
-            var lastUpdate = singleStartTime
-
-            val buffer = ByteArray(256 * 1024)
-            BufferedOutputStream(FileOutputStream(destFile), 256 * 1024).use { outStream ->
-                body.byteStream().use { inStream ->
-                    var read: Int
-                    while (inStream.read(buffer).also { read = it } != -1) {
-                        ensureActive()
-                        outStream.write(buffer, 0, read)
-                        bytesReadTotal += read
-                        val now = System.currentTimeMillis()
-                        if (now - lastUpdate > 120) {
-                            lastUpdate = now
-                            val elapsedSec = ((now - singleStartTime) / 1000.0).coerceAtLeast(0.05)
-                            val speed = (bytesReadTotal / elapsedSec).toLong()
-                            onProgress(bytesReadTotal, expectedTotal, speed, false)
-                        }
-                    }
-                    outStream.flush()
+                lastException = e
+                Log.w(TAG, "Download stream interrupted on attempt $attempt/$maxAttempts (${destFile.length()} bytes saved): ${e.message}")
+                if (attempt < maxAttempts) {
+                    delay(800L * attempt)
                 }
             }
-            return@withContext true
         }
+        throw (lastException ?: IOException("Failed to download archive after $maxAttempts attempts"))
     }
 
     private val _installerState = MutableStateFlow<LocalInstallerState>(LocalInstallerState.Idle)
@@ -734,15 +674,14 @@ object LocalEnvironmentManager {
     }
 
     /**
-     * Ensures Antigravity (`agy`) works seamlessly in Termux mode when Google's installer drops a glibc-linked
-     * arm64 ELF at `~/.local/bin/agy`. Moves any raw ELF binary at `~/.local/bin/agy` to `~/.local/bin/agy.real`
-     * (so `agy_ide_bridge` can still patch its CSRF header) and installs a glibc launcher script at `$PREFIX/bin/agy`
-     * with `~/.local/bin/agy` symlinked to it.
+     * Cleans up any legacy fake shell wrappers at `$PREFIX/bin/agy` or `~/.local/bin/agy` (which previously caused
+     * `agy_ide_bridge` to think `agy` was installed when it wasn't, and forced native Android Bionic `agy` binaries
+     * through glibc's `ld-linux-aarch64.so.1`). If a real `agy` binary exists at `~/.local/bin/agy`, links `$PREFIX/bin/agy`
+     * to it so terminal sessions can also invoke `agy` directly.
      */
     fun ensureAgyWrapper(context: Context) {
         if (!isTermuxPackage(context)) return
         try {
-            val prefix = getPrefixDir(context).absolutePath
             val home = getHomeDir(context).absolutePath
             val bin = getBinDir(context)
             if (!bin.exists()) return
@@ -750,72 +689,54 @@ object LocalEnvironmentManager {
             val localBin = File(home, ".local/bin").apply { mkdirs() }
             val localAgy = File(localBin, "agy")
             val realAgy = File(localBin, "agy.real")
-            val wrapper = File(bin, "agy")
+            val usrAgy = File(bin, "agy")
 
-            // If ~/.local/bin/agy is a raw ELF binary (installed or updated by Google's installer), relocate it to agy.real
-            if (localAgy.exists() && !isSymlink(localAgy) && localAgy.length() > 1024 * 1024L) {
-                val magic = ByteArray(4)
-                val readBytes = try {
-                    FileInputStream(localAgy).use { it.read(magic) }
-                } catch (_: Exception) { 0 }
-                if (readBytes == 4 && magic[0] == 0x7F.toByte() && magic[1] == 'E'.code.toByte() && magic[2] == 'L'.code.toByte() && magic[3] == 'F'.code.toByte()) {
-                    if (realAgy.exists()) realAgy.delete()
-                    localAgy.renameTo(realAgy)
-                    realAgy.setExecutable(true, false)
-                    realAgy.setReadable(true, false)
-                }
-            }
-
-            val script = """
-                |#!$prefix/bin/bash
-                |# Antigravity (agy) launcher written by AntiGem on every start.
-                |GLIBC_LIB="$prefix/glibc/lib"
-                |LOADER="${'$'}GLIBC_LIB/ld-linux-aarch64.so.1"
-                |TARGET=""
-                |for candidate in "$home/.local/bin/agy.va39" "$home/.local/bin/agy.real" "$home/.gemini/bin/agy" "$home/.antigravity/bin/agy"; do
-                |    if [ -f "${'$'}candidate" ] && [ -s "${'$'}candidate" ]; then
-                |        TARGET="${'$'}candidate"
-                |        break
-                |    fi
-                |done
-                |if [ -z "${'$'}TARGET" ]; then
-                |    echo "Antigravity CLI (agy) is not installed. Install it in AntiGem: Settings > Antigravity > Install CLI." >&2
-                |    exit 127
-                |fi
-                |if [ ! -e "/lib/ld-linux-aarch64.so.1" ] && [ -x "${'$'}LOADER" ]; then
-                |    unset LD_PRELOAD
-                |    exec "${'$'}LOADER" --library-path "${'$'}GLIBC_LIB" "${'$'}TARGET" "${'$'}@"
-                |fi
-                |exec "${'$'}TARGET" "${'$'}@"
-                |""".trimMargin()
-
-            if (!wrapper.exists() || isSymlink(wrapper) || wrapper.readText() != script) {
-                if (isSymlink(wrapper)) wrapper.delete()
-                val tmp = File(bin, ".agy.tmp")
-                tmp.writeText(script)
-                tmp.setExecutable(true, false)
-                tmp.setReadable(true, false)
-                if (!tmp.renameTo(wrapper)) {
-                    wrapper.delete()
-                    tmp.renameTo(wrapper)
-                }
-                wrapper.setExecutable(true, false)
-            }
-
-            // Only symlink ~/.local/bin/agy -> wrapper if agy.real or agy.va39 exists (so we don't fake installation before install)
-            if (realAgy.exists() || File(localBin, "agy.va39").exists()) {
-                val pointsToWrapper = try {
-                    Os.readlink(localAgy.absolutePath) == wrapper.absolutePath
+            fun isLegacyWrapper(f: File): Boolean {
+                if (!f.exists() || f.isDirectory || isSymlink(f) || f.length() > 8192L) return false
+                return try {
+                    f.readText().contains("Antigravity (agy) launcher written by AntiGem")
                 } catch (_: Exception) {
                     false
                 }
-                if (!pointsToWrapper) {
+            }
+
+            // 1. Remove any legacy fake wrapper script at $PREFIX/bin/agy or ~/.local/bin/agy
+            if (isLegacyWrapper(usrAgy)) {
+                usrAgy.delete()
+            }
+            if (isLegacyWrapper(localAgy)) {
+                localAgy.delete()
+            }
+
+            // 2. If an earlier version moved ~/.local/bin/agy to ~/.local/bin/agy.real, restore it back to ~/.local/bin/agy
+            if (realAgy.exists() && realAgy.length() > 100_000L) {
+                if (!localAgy.exists() || isSymlink(localAgy)) {
                     localAgy.delete()
-                    Os.symlink(wrapper.absolutePath, localAgy.absolutePath)
+                    realAgy.renameTo(localAgy)
+                    localAgy.setExecutable(true, false)
+                    localAgy.setReadable(true, false)
                 }
             }
+
+            // 3. Only expose $PREFIX/bin/agy if ~/.local/bin/agy actually exists as a real installed binary
+            if (localAgy.exists() && !localAgy.isDirectory && localAgy.length() > 100_000L) {
+                localAgy.setExecutable(true, false)
+                localAgy.setReadable(true, false)
+                val pointsToLocal = try {
+                    Os.readlink(usrAgy.absolutePath) == localAgy.absolutePath
+                } catch (_: Exception) {
+                    false
+                }
+                if (!pointsToLocal && (!usrAgy.exists() || isSymlink(usrAgy))) {
+                    usrAgy.delete()
+                    Os.symlink(localAgy.absolutePath, usrAgy.absolutePath)
+                }
+            } else if (isSymlink(usrAgy) && !usrAgy.exists()) {
+                // Remove dangling symlink when agy is not installed
+                usrAgy.delete()
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "Agy launcher setup failed: ${e.message}")
+            Log.w(TAG, "Agy launcher cleanup failed: ${e.message}")
         }
     }
 

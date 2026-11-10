@@ -3,8 +3,61 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
+
+// IsAndroid reports whether the bridge is running on an Android device (including when cross-compiled with GOOS=linux
+// and CGO_ENABLED=0 so that no Android NDK is needed at build time).
+func IsAndroid() bool {
+	if runtime.GOOS == "android" {
+		return true
+	}
+	if os.Getenv("ANDROID_ROOT") != "" || os.Getenv("ANDROID_DATA") != "" || os.Getenv("TERMUX_VERSION") != "" {
+		return true
+	}
+	if prefix := os.Getenv("PREFIX"); strings.HasPrefix(prefix, "/data/") {
+		return true
+	}
+	if home := os.Getenv("HOME"); strings.HasPrefix(home, "/data/") {
+		return true
+	}
+	if _, err := os.Stat("/system/bin/linker64"); err == nil {
+		return true
+	}
+	if _, err := os.Stat("/system/build.prop"); err == nil {
+		return true
+	}
+	return false
+}
+
+// TermuxPrefix returns the active Termux $PREFIX (e.g. /data/data/com.termux/files/usr) when on Android, or "".
+func TermuxPrefix(homeDir string) string {
+	if !IsAndroid() {
+		return ""
+	}
+	if p := os.Getenv("PREFIX"); p != "" {
+		return p
+	}
+	if homeDir != "" {
+		candidate := filepath.Join(filepath.Dir(homeDir), "usr")
+		if fi, err := os.Stat(candidate); err == nil && fi.IsDir() {
+			return candidate
+		}
+	}
+	for _, c := range []string{
+		"/data/data/com.termux/files/usr",
+		"/data/data/com.antigem/files/usr",
+	} {
+		if fi, err := os.Stat(c); err == nil && fi.IsDir() {
+			return c
+		}
+	}
+	if homeDir != "" {
+		return filepath.Join(filepath.Dir(homeDir), "usr")
+	}
+	return "/data/data/com.termux/files/usr"
+}
 
 // Config holds global runtime configuration parameters.
 type Config struct {

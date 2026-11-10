@@ -25,11 +25,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"gemini-server/pkg/config"
 )
 
 const (
@@ -193,13 +194,7 @@ func NewManager(homeDir, workspaceDir, binPath string) *Manager {
 
 // termuxPrefix is Termux's $PREFIX (…/files/usr), or "" when not on Android.
 func (m *Manager) termuxPrefix() string {
-	if runtime.GOOS != "android" {
-		return ""
-	}
-	if p := os.Getenv("PREFIX"); p != "" {
-		return p
-	}
-	return filepath.Join(filepath.Dir(m.HomeDir), "usr")
+	return config.TermuxPrefix(m.HomeDir)
 }
 
 // termuxNative reports a native Termux environment (not proot Ubuntu, which has its own /etc/os-release), where

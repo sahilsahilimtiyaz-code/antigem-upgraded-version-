@@ -10,11 +10,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"gemini-server/pkg/config"
 )
 
 // --- settings.json --------------------------------------------------------------------------------
@@ -489,7 +490,7 @@ func (m *Manager) handleCLIJob(w http.ResponseWriter, r *http.Request, action st
 			return
 		}
 	}
-	if runtime.GOOS == "android" && (action == "install" || action == "update") {
+	if config.IsAndroid() && (action == "install" || action == "update") {
 		// Termux: the official binary needs glibc, so it is downloaded like install.sh does and started by the
 		// app's wrapper (see native_install.go)
 		nj := &cliJob{Kind: action, Running: true, Started: time.Now()}
