@@ -25,7 +25,7 @@ import (
 // A running hub keeps the agy it started with until the server restarts; the app restarts the server after an update
 // that installed a newer agy (the log's "Updated agy <old> -> <new>." line).
 
-const agyInstallCommand = "curl -fsSL https://antigravity.google/cli/install.sh | bash"
+const agyInstallCommand = `export PATH="$HOME/.local/bin:$HOME/.gemini/bin:$HOME/.antigravity/bin:/antigem/bin:/usr/local/bin:/usr/bin:/bin:$PATH"; if ! command -v curl >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y curl ca-certificates; elif command -v pkg >/dev/null 2>&1; then pkg install -y curl ca-certificates; fi; fi; curl -fsSL https://antigravity.google/cli/install.sh | bash`
 
 type agyCliJob struct {
 	mu       sync.Mutex
@@ -72,6 +72,18 @@ var (
 // by hand without --bin, the one it found at startup. With neither, where Google's installer puts it.
 func (h *Handler) agyPath() string {
 	if h.HubManager != nil {
+		if p := h.HubManager.GetAgyBin(); p != "" && agyInstalled(p) {
+			return p
+		}
+	}
+	found := hub.FindAllAgyBinaries()
+	if len(found) > 0 {
+		if h.HubManager != nil && !agyInstalled(h.HubManager.GetAgyBin()) {
+			h.HubManager.SetAgyBin(found[0])
+		}
+		return found[0]
+	}
+	if h.HubManager != nil {
 		if p := h.HubManager.GetAgyBin(); p != "" {
 			return p
 		}
@@ -101,7 +113,30 @@ func agyVersion(bin string) string {
 	cmd.Stdin = nil
 	// stdout only: agy logs to stderr before it is set up (on Android "ERROR: logging before google.Init: I… Initialized
 	// Android local timezone…"), which is not an error and not the version
-	out, _ := cmd.Output()
+	out, err := cmd.Output()
+	if err != nil || len(out) == 0 {
+		// Fallback for Termux glibc environment if /lib/ld-linux-aarch64.so.1 is missing
+		prefix := os.Getenv("PREFIX")
+		if prefix == "" {
+			prefix = "/data/data/com.termux/files/usr"
+		}
+		ldLinux := prefix + "/glibc/lib/ld-linux-aarch64.so.1"
+		glibcLib := prefix + "/glibc/lib"
+		if _, statErr := os.Stat(ldLinux); statErr == nil {
+			glibcCmd := exec.CommandContext(ctx, ldLinux, "--library-path", glibcLib, bin, "--version")
+			glibcCmd.Stdin = nil
+			var cleanEnv []string
+			for _, kv := range os.Environ() {
+				if !strings.HasPrefix(kv, "LD_PRELOAD=") {
+					cleanEnv = append(cleanEnv, kv)
+				}
+			}
+			glibcCmd.Env = cleanEnv
+			if glibcOut, glibcErr := glibcCmd.Output(); glibcErr == nil && len(glibcOut) > 0 {
+				out = glibcOut
+			}
+		}
+	}
 	v := versionLine(string(out))
 	if v != "" {
 		agyVerPath, agyVerStamp, agyVerValue = bin, fi.ModTime(), v
@@ -157,6 +192,14 @@ func (h *Handler) AgyCliInstallHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		target := h.agyPath()
+		if !agyInstalled(target) {
+			if found := hub.FindAllAgyBinaries(); len(found) > 0 {
+				target = found[0]
+				if h.HubManager != nil {
+					h.HubManager.SetAgyBin(target)
+				}
+			}
+		}
 		if !agyInstalled(target) {
 			// the installer always uses ~/.local/bin/agy; the app is set to another path
 			fmt.Fprintf(job, "\nagy was installed to %s, but the app is set to use %s. Change the agy path in the app's settings, then restart the server.\n", hub.InstallerAgyPath(), target)

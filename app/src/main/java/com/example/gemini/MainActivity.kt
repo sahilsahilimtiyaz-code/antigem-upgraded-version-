@@ -50,6 +50,29 @@ class MainActivity : ComponentActivity() {
 
     private val chatViewModel: ChatViewModel by lazy { ChatViewModelHolder.get(application) }
 
+    private fun enableHighRefreshRate() {
+        try {
+            val display = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                this.display
+            } else {
+                @Suppress("DEPRECATION")
+                windowManager.defaultDisplay
+            } ?: return
+            val modes = display.supportedModes
+            val currentMode = display.mode
+            val bestMode = modes
+                .filter { it.physicalWidth == currentMode.physicalWidth && it.physicalHeight == currentMode.physicalHeight }
+                .maxByOrNull { it.refreshRate }
+            if (bestMode != null && bestMode.refreshRate > 60f) {
+                val params = window.attributes
+                params.preferredDisplayModeId = bestMode.modeId
+                params.preferredRefreshRate = bestMode.refreshRate
+                window.attributes = params
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -61,10 +84,7 @@ class MainActivity : ComponentActivity() {
         com.example.gemini.data.remote.inspector.NetworkInspectorManager.isFloatingBubbleEnabled =
             chatViewModel.authPreferences.getFloatingNetworkInspectorEnabledSync()
 
-        try {
-            android.webkit.WebView.enableSlowWholeDocumentDraw()
-        } catch (_: Exception) {
-        }
+        enableHighRefreshRate()
 
         if (com.example.gemini.ui.components.PermissionUtils.hasNotificationPermission(this)) {
             com.example.gemini.data.service.TermuxService.start(this)

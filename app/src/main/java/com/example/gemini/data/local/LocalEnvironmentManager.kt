@@ -77,12 +77,165 @@ object LocalEnvironmentManager {
     private var lastNotificationTime = 0L
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
+        .dispatcher(okhttp3.Dispatcher().apply {
+            maxRequests = 64
+            maxRequestsPerHost = 16
+        })
+        .connectionPool(okhttp3.ConnectionPool(32, 5, TimeUnit.MINUTES))
+        .protocols(listOf(okhttp3.Protocol.HTTP_2, okhttp3.Protocol.HTTP_1_1))
+        .connectTimeout(25, TimeUnit.SECONDS)
         .readTimeout(180, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .retryOnConnectionFailure(true)
         .build()
+
+    /**
+     * High-speed downloader supporting 4x parallel HTTP Range connections for large archives (>= 4 MB)
+     * with seamless fallback to a 256 KB buffered single stream.
+     */
+    private suspend fun downloadFileFast(
+        url: String,
+        destFile: File,
+        fallbackExpectedBytes: Long,
+        onProgress: (bytesDownloaded: Long, totalBytes: Long, speedBytesPerSec: Long, isMultiStream: Boolean) -> Unit
+    ): Boolean = withContext(Dispatchers.IO) {
+        val userAgent = "GeminiApp-LocalTerminal/${Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64"}"
+        val startTime = System.currentTimeMillis()
+        var lastProgressUpdate = startTime
+
+        // 1. Probe range support & final URL via a 1-byte range request
+        var resolvedUrl = url
+        var totalSize = -1L
+        var supportsRanges = false
+        try {
+            val probeReq = Request.Builder()
+                .url(url)
+                .header("User-Agent", userAgent)
+                .header("Range", "bytes=0-0")
+                .build()
+            httpClient.newCall(probeReq).execute().use { resp ->
+                resolvedUrl = resp.request.url.toString()
+                if (resp.code == 206) {
+                    val contentRange = resp.header("Content-Range") // e.g. "bytes 0-0/36700160"
+                    val slashIdx = contentRange?.lastIndexOf('/') ?: -1
+                    if (slashIdx != -1 && contentRange != null) {
+                        totalSize = contentRange.substring(slashIdx + 1).trim().toLongOrNull() ?: -1L
+                    }
+                    if (totalSize >= 4 * 1024 * 1024L) {
+                        supportsRanges = true
+                    }
+                } else if (resp.isSuccessful) {
+                    totalSize = resp.body?.contentLength() ?: -1L
+                }
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "Range probe skipped for $url: ${e.message}")
+        }
+
+        // 2. Attempt 4-connection parallel Range download when supported
+        if (supportsRanges && totalSize >= 4 * 1024 * 1024L) {
+            try {
+                if (destFile.exists()) destFile.delete()
+                RandomAccessFile(destFile, "rw").use { raf ->
+                    raf.setLength(totalSize)
+                }
+                val numChunks = 4
+                val chunkSize = totalSize / numChunks
+                val downloadedBytes = java.util.concurrent.atomic.AtomicLong(0L)
+                val progressLock = Any()
+
+                val allChunksOk = coroutineScope {
+                    (0 until numChunks).map { index ->
+                        async(Dispatchers.IO) {
+                            val startByte = index * chunkSize
+                            val endByte = if (index == numChunks - 1) totalSize - 1 else (startByte + chunkSize - 1)
+                            val rangeReq = Request.Builder()
+                                .url(resolvedUrl)
+                                .header("User-Agent", userAgent)
+                                .header("Range", "bytes=$startByte-$endByte")
+                                .build()
+                            httpClient.newCall(rangeReq).execute().use { response ->
+                                if (response.code != 206) return@use false
+                                val body = response.body ?: return@use false
+                                RandomAccessFile(destFile, "rw").use { raf ->
+                                    raf.seek(startByte)
+                                    val buffer = ByteArray(256 * 1024)
+                                    body.byteStream().use { inStream ->
+                                        var read: Int
+                                        while (inStream.read(buffer).also { read = it } != -1) {
+                                            ensureActive()
+                                            raf.write(buffer, 0, read)
+                                            val currentTotal = downloadedBytes.addAndGet(read.toLong())
+                                            val now = System.currentTimeMillis()
+                                            if (now - lastProgressUpdate > 120) {
+                                                synchronized(progressLock) {
+                                                    if (now - lastProgressUpdate > 120) {
+                                                        lastProgressUpdate = now
+                                                        val elapsedSec = ((now - startTime) / 1000.0).coerceAtLeast(0.05)
+                                                        val speed = (currentTotal / elapsedSec).toLong()
+                                                        onProgress(currentTotal, totalSize, speed, true)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                true
+                            }
+                        }
+                    }.awaitAll().all { it }
+                }
+
+                if (allChunksOk && destFile.exists() && destFile.length() == totalSize) {
+                    val elapsedSec = ((System.currentTimeMillis() - startTime) / 1000.0).coerceAtLeast(0.05)
+                    onProgress(totalSize, totalSize, (totalSize / elapsedSec).toLong(), true)
+                    return@withContext true
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Parallel range download fallback to single stream: ${e.message}")
+            }
+        }
+
+        // 3. High-throughput 256 KB buffered single-stream download
+        if (destFile.exists()) destFile.delete()
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", userAgent)
+            .build()
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IOException("HTTP ${response.code} from server")
+            }
+            val body = response.body ?: throw IOException("Empty response body")
+            val contentLength = body.contentLength()
+            val expectedTotal = if (contentLength > 0) contentLength else fallbackExpectedBytes
+            var bytesReadTotal = 0L
+            val singleStartTime = System.currentTimeMillis()
+            var lastUpdate = singleStartTime
+
+            val buffer = ByteArray(256 * 1024)
+            BufferedOutputStream(FileOutputStream(destFile), 256 * 1024).use { outStream ->
+                body.byteStream().use { inStream ->
+                    var read: Int
+                    while (inStream.read(buffer).also { read = it } != -1) {
+                        ensureActive()
+                        outStream.write(buffer, 0, read)
+                        bytesReadTotal += read
+                        val now = System.currentTimeMillis()
+                        if (now - lastUpdate > 120) {
+                            lastUpdate = now
+                            val elapsedSec = ((now - singleStartTime) / 1000.0).coerceAtLeast(0.05)
+                            val speed = (bytesReadTotal / elapsedSec).toLong()
+                            onProgress(bytesReadTotal, expectedTotal, speed, false)
+                        }
+                    }
+                    outStream.flush()
+                }
+            }
+            return@withContext true
+        }
+    }
 
     private val _installerState = MutableStateFlow<LocalInstallerState>(LocalInstallerState.Idle)
     val installerState: StateFlow<LocalInstallerState> = _installerState.asStateFlow()
@@ -394,20 +547,23 @@ object LocalEnvironmentManager {
         File(ubuntuDir, "proc").mkdirs()
         File(ubuntuDir, "sys").mkdirs()
         File(ubuntuDir, "root").mkdirs()
+        val prootExtraPath = "/root/.local/bin:/root/.gemini/bin:/root/.antigravity/bin:/antigem/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         val rootBashrc = File(File(ubuntuDir, "root"), ".bashrc")
-        if (!rootBashrc.exists() || !rootBashrc.readText().contains("/usr/local/sbin")) {
-            rootBashrc.appendText("\nexport PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH\n")
+        if (!rootBashrc.exists() || !rootBashrc.readText().contains("/antigem/bin")) {
+            rootBashrc.appendText("\nexport PATH=\"$prootExtraPath:\$PATH\"\n")
         }
         // Ubuntu's /etc/zsh/zshrc compinit does ~15k fpath stats under proot (~30s first start)
         val rootZshenv = File(File(ubuntuDir, "root"), ".zshenv")
         if (!rootZshenv.exists()) {
-            rootZshenv.writeText("skip_global_compinit=1\n")
+            rootZshenv.writeText("skip_global_compinit=1\nexport PATH=\"$prootExtraPath:\$PATH\"\n")
+        } else if (!rootZshenv.readText().contains("/antigem/bin")) {
+            rootZshenv.appendText("\nexport PATH=\"$prootExtraPath:\$PATH\"\n")
         }
 
         val profileD = File(File(ubuntuDir, "etc"), "profile.d").apply { mkdirs() }
         val termuxProfile = File(profileD, "termux-profile.sh")
         termuxProfile.writeText(
-            "export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH\"\n" +
+            "export PATH=\"$prootExtraPath:\$PATH\"\n" +
             "export HOME=\"/root\"\n" +
             "export USER=\"root\"\n" +
             "export LOGNAME=\"root\"\n" +
@@ -574,6 +730,92 @@ object LocalEnvironmentManager {
             }
         } catch (e: Exception) {
             Log.w(TAG, "Claude launcher setup failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Ensures Antigravity (`agy`) works seamlessly in Termux mode when Google's installer drops a glibc-linked
+     * arm64 ELF at `~/.local/bin/agy`. Moves any raw ELF binary at `~/.local/bin/agy` to `~/.local/bin/agy.real`
+     * (so `agy_ide_bridge` can still patch its CSRF header) and installs a glibc launcher script at `$PREFIX/bin/agy`
+     * with `~/.local/bin/agy` symlinked to it.
+     */
+    fun ensureAgyWrapper(context: Context) {
+        if (!isTermuxPackage(context)) return
+        try {
+            val prefix = getPrefixDir(context).absolutePath
+            val home = getHomeDir(context).absolutePath
+            val bin = getBinDir(context)
+            if (!bin.exists()) return
+
+            val localBin = File(home, ".local/bin").apply { mkdirs() }
+            val localAgy = File(localBin, "agy")
+            val realAgy = File(localBin, "agy.real")
+            val wrapper = File(bin, "agy")
+
+            // If ~/.local/bin/agy is a raw ELF binary (installed or updated by Google's installer), relocate it to agy.real
+            if (localAgy.exists() && !isSymlink(localAgy) && localAgy.length() > 1024 * 1024L) {
+                val magic = ByteArray(4)
+                val readBytes = try {
+                    FileInputStream(localAgy).use { it.read(magic) }
+                } catch (_: Exception) { 0 }
+                if (readBytes == 4 && magic[0] == 0x7F.toByte() && magic[1] == 'E'.code.toByte() && magic[2] == 'L'.code.toByte() && magic[3] == 'F'.code.toByte()) {
+                    if (realAgy.exists()) realAgy.delete()
+                    localAgy.renameTo(realAgy)
+                    realAgy.setExecutable(true, false)
+                    realAgy.setReadable(true, false)
+                }
+            }
+
+            val script = """
+                |#!$prefix/bin/bash
+                |# Antigravity (agy) launcher written by AntiGem on every start.
+                |GLIBC_LIB="$prefix/glibc/lib"
+                |LOADER="${'$'}GLIBC_LIB/ld-linux-aarch64.so.1"
+                |TARGET=""
+                |for candidate in "$home/.local/bin/agy.va39" "$home/.local/bin/agy.real" "$home/.gemini/bin/agy" "$home/.antigravity/bin/agy"; do
+                |    if [ -f "${'$'}candidate" ] && [ -s "${'$'}candidate" ]; then
+                |        TARGET="${'$'}candidate"
+                |        break
+                |    fi
+                |done
+                |if [ -z "${'$'}TARGET" ]; then
+                |    echo "Antigravity CLI (agy) is not installed. Install it in AntiGem: Settings > Antigravity > Install CLI." >&2
+                |    exit 127
+                |fi
+                |if [ ! -e "/lib/ld-linux-aarch64.so.1" ] && [ -x "${'$'}LOADER" ]; then
+                |    unset LD_PRELOAD
+                |    exec "${'$'}LOADER" --library-path "${'$'}GLIBC_LIB" "${'$'}TARGET" "${'$'}@"
+                |fi
+                |exec "${'$'}TARGET" "${'$'}@"
+                |""".trimMargin()
+
+            if (!wrapper.exists() || isSymlink(wrapper) || wrapper.readText() != script) {
+                if (isSymlink(wrapper)) wrapper.delete()
+                val tmp = File(bin, ".agy.tmp")
+                tmp.writeText(script)
+                tmp.setExecutable(true, false)
+                tmp.setReadable(true, false)
+                if (!tmp.renameTo(wrapper)) {
+                    wrapper.delete()
+                    tmp.renameTo(wrapper)
+                }
+                wrapper.setExecutable(true, false)
+            }
+
+            // Only symlink ~/.local/bin/agy -> wrapper if agy.real or agy.va39 exists (so we don't fake installation before install)
+            if (realAgy.exists() || File(localBin, "agy.va39").exists()) {
+                val pointsToWrapper = try {
+                    Os.readlink(localAgy.absolutePath) == wrapper.absolutePath
+                } catch (_: Exception) {
+                    false
+                }
+                if (!pointsToWrapper) {
+                    localAgy.delete()
+                    Os.symlink(wrapper.absolutePath, localAgy.absolutePath)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Agy launcher setup failed: ${e.message}")
         }
     }
 
@@ -925,73 +1167,37 @@ object LocalEnvironmentManager {
                     updateInstallNotification(appContext, "Downloading $titlePrefix", "Connecting...", -1)
 
                     try {
-                        val request = Request.Builder()
-                            .url(targetUrl)
-                            .header("User-Agent", "GeminiApp-LocalTerminal/${Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64"}")
-                            .build()
-
-                        httpClient.newCall(request).execute().use { response ->
-                            if (!response.isSuccessful) {
-                                val errorMsg = "Download failed: HTTP ${response.code} from release server."
-                                updateInstallNotification(appContext, "Installation Failed", errorMsg, -2, ongoing = false, force = true)
-                                _installerState.value = LocalInstallerState.Error(errorMessage = errorMsg, canRetry = true)
-                                return@withContext false
-                            }
-
-                            val body = response.body
-                            if (body == null) {
-                                val errorMsg = "Download failed: Empty response body."
-                                updateInstallNotification(appContext, "Installation Failed", errorMsg, -2, ongoing = false, force = true)
-                                _installerState.value = LocalInstallerState.Error(errorMessage = errorMsg, canRetry = true)
-                                return@withContext false
-                            }
-
-                            val contentLength = body.contentLength()
-                            val expectedTotal = if (contentLength > 0) contentLength else targetSizeBytes
-                            var bytesReadTotal = 0L
-                            val startTime = System.currentTimeMillis()
-
-                            val buffer = ByteArray(64 * 1024)
-                            FileOutputStream(tempZipFile).use { outStream ->
-                                body.byteStream().use { inStream ->
-                                    var read: Int
-                                    var lastUpdate = System.currentTimeMillis()
-                                    while (inStream.read(buffer).also { read = it } != -1) {
-                                        outStream.write(buffer, 0, read)
-                                        bytesReadTotal += read
-
-                                        val now = System.currentTimeMillis()
-                                        if (now - lastUpdate > 120) {
-                                            val elapsedSec = (now - startTime) / 1000.0
-                                            val speed = if (elapsedSec > 0) bytesReadTotal / elapsedSec else 0.0
-                                            val speedFormatted = "${formatFileSize(speed.toLong())}/s"
-                                            val fraction = (bytesReadTotal.toFloat() / expectedTotal.toFloat()).coerceIn(0.05f, 0.95f)
-
-                                            _installerState.value = LocalInstallerState.Downloading(
-                                                bytesDownloaded = bytesReadTotal,
-                                                totalBytes = expectedTotal,
-                                                progressFraction = fraction,
-                                                speedText = speedFormatted,
-                                                currentPackageName = targetAsset
-                                            )
-                                            val pct = (fraction * 100).toInt()
-                                            updateInstallNotification(appContext, "Downloading $titlePrefix ($pct%)", "$speedFormatted • $targetAsset", pct)
-                                            lastUpdate = now
-                                        }
-                                    }
-                                }
-                            }
-
-                            finalDownloadedSize = tempZipFile.length()
-                            if (finalDownloadedSize >= MIN_BOOTSTRAP_SIZE_BYTES && validateArchiveIntegrity(tempZipFile)) {
-                                downloadSucceeded = true
+                        downloadFileFast(
+                            url = targetUrl,
+                            destFile = tempZipFile,
+                            fallbackExpectedBytes = targetSizeBytes
+                        ) { bytesReadTotal, expectedTotal, speedBytesPerSec, isMultiStream ->
+                            val speedFormatted = if (isMultiStream) {
+                                "4x Turbo • ${formatFileSize(speedBytesPerSec)}/s"
                             } else {
-                                tempZipFile.delete()
-                                val errorMsg = "Downloaded rootfs archive was incomplete or corrupted."
-                                updateInstallNotification(appContext, "Installation Failed", errorMsg, -2, ongoing = false, force = true)
-                                _installerState.value = LocalInstallerState.Error(errorMessage = errorMsg, canRetry = true)
-                                return@withContext false
+                                "${formatFileSize(speedBytesPerSec)}/s"
                             }
+                            val fraction = (bytesReadTotal.toFloat() / expectedTotal.toFloat()).coerceIn(0.05f, 0.95f)
+                            _installerState.value = LocalInstallerState.Downloading(
+                                bytesDownloaded = bytesReadTotal,
+                                totalBytes = expectedTotal,
+                                progressFraction = fraction,
+                                speedText = speedFormatted,
+                                currentPackageName = targetAsset
+                            )
+                            val pct = (fraction * 100).toInt()
+                            updateInstallNotification(appContext, "Downloading $titlePrefix ($pct%)", "$speedFormatted • $targetAsset", pct)
+                        }
+
+                        finalDownloadedSize = tempZipFile.length()
+                        if (finalDownloadedSize >= MIN_BOOTSTRAP_SIZE_BYTES && validateArchiveIntegrity(tempZipFile)) {
+                            downloadSucceeded = true
+                        } else {
+                            tempZipFile.delete()
+                            val errorMsg = "Downloaded rootfs archive was incomplete or corrupted."
+                            updateInstallNotification(appContext, "Installation Failed", errorMsg, -2, ongoing = false, force = true)
+                            _installerState.value = LocalInstallerState.Error(errorMessage = errorMsg, canRetry = true)
+                            return@withContext false
                         }
                     } catch (e: Exception) {
                         Log.w(TAG, "Download attempt failed from $targetUrl: ${e.message}")
@@ -1028,65 +1234,33 @@ object LocalEnvironmentManager {
                             )
                             updateInstallNotification(appContext, "Downloading Linux Rootfs", "Connecting mirror ${index + 1}...", -1)
 
-                            val request = Request.Builder()
-                                .url(url)
-                                .header("User-Agent", "GeminiApp-LocalTerminal/${Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64"}")
-                                .build()
-
-                            httpClient.newCall(request).execute().use { response ->
-                                if (!response.isSuccessful) {
-                                    Log.w(TAG, "Mirror returned HTTP ${response.code}: $url")
-                                    return@use
-                                }
-
-                                val body = response.body ?: return@use
-                                val contentLength = body.contentLength()
-                                if (contentLength in 1 until MIN_BOOTSTRAP_SIZE_BYTES) {
-                                    Log.w(TAG, "Rejected URL $url due to content length: $contentLength bytes (< 10 MB)")
-                                    return@use
-                                }
-
-                                val expectedTotal = if (contentLength > 0) contentLength else 35 * 1024 * 1024L
-                                var bytesReadTotal = 0L
-                                val startTime = System.currentTimeMillis()
-
-                                val buffer = ByteArray(64 * 1024)
-                                FileOutputStream(tempZipFile).use { outStream ->
-                                    body.byteStream().use { inStream ->
-                                        var read: Int
-                                        var lastUpdate = System.currentTimeMillis()
-                                        while (inStream.read(buffer).also { read = it } != -1) {
-                                            outStream.write(buffer, 0, read)
-                                            bytesReadTotal += read
-
-                                            val now = System.currentTimeMillis()
-                                            if (now - lastUpdate > 120) {
-                                                val elapsedSec = (now - startTime) / 1000.0
-                                                val speed = if (elapsedSec > 0) bytesReadTotal / elapsedSec else 0.0
-                                                val speedFormatted = "${formatFileSize(speed.toLong())}/s"
-                                                val fraction = (bytesReadTotal.toFloat() / expectedTotal.toFloat()).coerceIn(0.05f, 0.95f)
-
-                                                _installerState.value = LocalInstallerState.Downloading(
-                                                    bytesDownloaded = bytesReadTotal,
-                                                    totalBytes = expectedTotal,
-                                                    progressFraction = fraction,
-                                                    speedText = speedFormatted,
-                                                    currentPackageName = "bootstrap-$arch.zip"
-                                                )
-                                                val pct = (fraction * 100).toInt()
-                                                updateInstallNotification(appContext, "Downloading Linux Rootfs ($pct%)", "$speedFormatted • bootstrap-$arch.zip", pct)
-                                                lastUpdate = now
-                                            }
-                                        }
-                                    }
-                                }
-
-                                finalDownloadedSize = tempZipFile.length()
-                                if (finalDownloadedSize >= MIN_BOOTSTRAP_SIZE_BYTES && validateArchiveIntegrity(tempZipFile)) {
-                                    downloadSucceeded = true
+                            downloadFileFast(
+                                url = url,
+                                destFile = tempZipFile,
+                                fallbackExpectedBytes = 35 * 1024 * 1024L
+                            ) { bytesReadTotal, expectedTotal, speedBytesPerSec, isMultiStream ->
+                                val speedFormatted = if (isMultiStream) {
+                                    "4x Turbo • ${formatFileSize(speedBytesPerSec)}/s"
                                 } else {
-                                    tempZipFile.delete()
+                                    "${formatFileSize(speedBytesPerSec)}/s"
                                 }
+                                val fraction = (bytesReadTotal.toFloat() / expectedTotal.toFloat()).coerceIn(0.05f, 0.95f)
+                                _installerState.value = LocalInstallerState.Downloading(
+                                    bytesDownloaded = bytesReadTotal,
+                                    totalBytes = expectedTotal,
+                                    progressFraction = fraction,
+                                    speedText = speedFormatted,
+                                    currentPackageName = "bootstrap-$arch.zip"
+                                )
+                                val pct = (fraction * 100).toInt()
+                                updateInstallNotification(appContext, "Downloading Linux Rootfs ($pct%)", "$speedFormatted • bootstrap-$arch.zip", pct)
+                            }
+
+                            finalDownloadedSize = tempZipFile.length()
+                            if (finalDownloadedSize >= MIN_BOOTSTRAP_SIZE_BYTES && validateArchiveIntegrity(tempZipFile)) {
+                                downloadSucceeded = true
+                            } else {
+                                tempZipFile.delete()
                             }
 
                             if (downloadSucceeded) break
@@ -1106,88 +1280,55 @@ object LocalEnvironmentManager {
                         return@withContext false
                     }
 
+                    val pkgLabel = customUrl.substringAfterLast("/").take(30)
                     _installerState.value = LocalInstallerState.Downloading(
                         bytesDownloaded = 0L,
                         totalBytes = 35 * 1024 * 1024L,
                         progressFraction = 0.05f,
                         speedText = "Connecting direct URL...",
-                        currentPackageName = customUrl.substringAfterLast("/").take(30)
+                        currentPackageName = pkgLabel
                     )
                     updateInstallNotification(appContext, "Downloading Linux Rootfs", "Connecting direct URL...", -1)
 
                     try {
-                        val request = Request.Builder()
-                            .url(customUrl)
-                            .header("User-Agent", "GeminiApp-LocalTerminal/${Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64"}")
-                            .build()
-
-                        httpClient.newCall(request).execute().use { response ->
-                            if (!response.isSuccessful) {
-                                val errorMsg = "Server returned HTTP ${response.code} for: $customUrl"
-                                updateInstallNotification(appContext, "Installation Failed", errorMsg, -2, ongoing = false, force = true)
-                                _installerState.value = LocalInstallerState.Error(errorMessage = errorMsg, canRetry = true)
-                                return@withContext false
+                        downloadFileFast(
+                            url = customUrl,
+                            destFile = tempZipFile,
+                            fallbackExpectedBytes = 35 * 1024 * 1024L
+                        ) { bytesReadTotal, expectedTotal, speedBytesPerSec, isMultiStream ->
+                            val speedFormatted = if (isMultiStream) {
+                                "4x Turbo • ${formatFileSize(speedBytesPerSec)}/s"
+                            } else {
+                                "${formatFileSize(speedBytesPerSec)}/s"
                             }
-
-                            val body = response.body
-                            if (body == null) {
-                                updateInstallNotification(appContext, "Installation Failed", "Empty response body", -2, ongoing = false, force = true)
-                                _installerState.value = LocalInstallerState.Error(errorMessage = "Empty response body received from URL.", canRetry = true)
-                                return@withContext false
-                            }
-
-                            val contentLength = body.contentLength()
-                            val expectedTotal = if (contentLength > 0) contentLength else 35 * 1024 * 1024L
-                            var bytesReadTotal = 0L
-                            val startTime = System.currentTimeMillis()
-
-                            val buffer = ByteArray(64 * 1024)
-                            FileOutputStream(tempZipFile).use { outStream ->
-                                body.byteStream().use { inStream ->
-                                    var read: Int
-                                    var lastUpdate = System.currentTimeMillis()
-                                    while (inStream.read(buffer).also { read = it } != -1) {
-                                        outStream.write(buffer, 0, read)
-                                        bytesReadTotal += read
-
-                                        val now = System.currentTimeMillis()
-                                        if (now - lastUpdate > 120) {
-                                            val elapsedSec = (now - startTime) / 1000.0
-                                            val speed = if (elapsedSec > 0) bytesReadTotal / elapsedSec else 0.0
-                                            val speedFormatted = "${formatFileSize(speed.toLong())}/s"
-                                            val fraction = (bytesReadTotal.toFloat() / expectedTotal.toFloat()).coerceIn(0.05f, 0.95f)
-
-                                            _installerState.value = LocalInstallerState.Downloading(
-                                                bytesDownloaded = bytesReadTotal,
-                                                totalBytes = expectedTotal,
-                                                progressFraction = fraction,
-                                                speedText = speedFormatted,
-                                                currentPackageName = customUrl.substringAfterLast("/").take(25)
-                                            )
-                                            val pct = (fraction * 100).toInt()
-                                            updateInstallNotification(appContext, "Downloading Linux Rootfs ($pct%)", speedFormatted, pct)
-                                            lastUpdate = now
-                                        }
-                                    }
-                                }
-                            }
-                            finalDownloadedSize = tempZipFile.length()
-                            if (finalDownloadedSize < MIN_BOOTSTRAP_SIZE_BYTES) {
-                                val errorMsg = "Downloaded file from URL is only ${formatFileSize(finalDownloadedSize)} (< 10 MB required)."
-                                tempZipFile.delete()
-                                updateInstallNotification(appContext, "Installation Failed", errorMsg, -2, ongoing = false, force = true)
-                                _installerState.value = LocalInstallerState.Error(errorMessage = errorMsg, canRetry = true)
-                                return@withContext false
-                            }
-                            if (!validateArchiveIntegrity(tempZipFile)) {
-                                val errorMsg = "Downloaded file is not a valid archive."
-                                tempZipFile.delete()
-                                updateInstallNotification(appContext, "Installation Failed", errorMsg, -2, ongoing = false, force = true)
-                                _installerState.value = LocalInstallerState.Error(errorMessage = errorMsg, canRetry = true)
-                                return@withContext false
-                            }
-                            downloadSucceeded = true
+                            val fraction = (bytesReadTotal.toFloat() / expectedTotal.toFloat()).coerceIn(0.05f, 0.95f)
+                            _installerState.value = LocalInstallerState.Downloading(
+                                bytesDownloaded = bytesReadTotal,
+                                totalBytes = expectedTotal,
+                                progressFraction = fraction,
+                                speedText = speedFormatted,
+                                currentPackageName = pkgLabel.take(25)
+                            )
+                            val pct = (fraction * 100).toInt()
+                            updateInstallNotification(appContext, "Downloading Linux Rootfs ($pct%)", speedFormatted, pct)
                         }
+
+                        finalDownloadedSize = tempZipFile.length()
+                        if (finalDownloadedSize < MIN_BOOTSTRAP_SIZE_BYTES) {
+                            val errorMsg = "Downloaded file from URL is only ${formatFileSize(finalDownloadedSize)} (< 10 MB required)."
+                            tempZipFile.delete()
+                            updateInstallNotification(appContext, "Installation Failed", errorMsg, -2, ongoing = false, force = true)
+                            _installerState.value = LocalInstallerState.Error(errorMessage = errorMsg, canRetry = true)
+                            return@withContext false
+                        }
+                        if (!validateArchiveIntegrity(tempZipFile)) {
+                            val errorMsg = "Downloaded file is not a valid archive."
+                            tempZipFile.delete()
+                            updateInstallNotification(appContext, "Installation Failed", errorMsg, -2, ongoing = false, force = true)
+                            _installerState.value = LocalInstallerState.Error(errorMessage = errorMsg, canRetry = true)
+                            return@withContext false
+                        }
+                        downloadSucceeded = true
                     } catch (e: Exception) {
                         val errorMsg = "Direct download failed: ${e.localizedMessage ?: e.message}"
                         updateInstallNotification(appContext, "Installation Failed", errorMsg, -2, ongoing = false, force = true)
@@ -1371,7 +1512,9 @@ object LocalEnvironmentManager {
                 val destDir = if (isUbuntuMode) getUbuntuRootDir(appContext) else prefixDir
                 log("Extracting rootfs files from $archiveFormatName tarball into ${destDir.absolutePath}...")
 
-                val rawStream = BufferedInputStream(FileInputStream(archiveToExtract))
+                val createdDirs = HashSet<String>(512)
+                val sharedCopyBuf = ByteArray(128 * 1024)
+                val rawStream = BufferedInputStream(FileInputStream(archiveToExtract), 256 * 1024)
                 val compressedStream: InputStream = if (isXzTar) {
                     XZCompressorInputStream(rawStream)
                 } else {
@@ -1404,9 +1547,10 @@ object LocalEnvironmentManager {
 
                             if (targetFile != null) {
                                 targetFile.parentFile?.let { p ->
-                                    if (!p.exists()) {
+                                    val pPath = p.absolutePath
+                                    if (createdDirs.add(pPath) && !p.exists()) {
                                         p.mkdirs()
-                                        try { Os.chmod(p.absolutePath, 493) } catch (_: Exception) {}
+                                        try { Os.chmod(pPath, 493) } catch (_: Exception) {}
                                     }
                                 }
 
@@ -1424,11 +1568,14 @@ object LocalEnvironmentManager {
                                         }
                                     }
                                 } else if (entry.isDirectory) {
-                                    targetFile.mkdirs()
+                                    val dirPath = targetFile.absolutePath
+                                    if (createdDirs.add(dirPath)) {
+                                        targetFile.mkdirs()
+                                    }
                                     val dirMode = if (isUbuntuMode && entry.mode != 0) {
                                         (entry.mode and 511) or 448
                                     } else if (entry.mode != 0) (entry.mode and 511) or 493 else 493
-                                    try { Os.chmod(targetFile.absolutePath, dirMode) } catch (_: Exception) {}
+                                    try { Os.chmod(dirPath, dirMode) } catch (_: Exception) {}
                                 } else {
                                     if (targetFile.exists() || isSymlink(targetFile)) {
                                         targetFile.setWritable(true, true)
@@ -1436,7 +1583,10 @@ object LocalEnvironmentManager {
                                     }
                                     try {
                                         FileOutputStream(targetFile).use { fos ->
-                                            tarIn.copyTo(fos)
+                                            var n: Int
+                                            while (tarIn.read(sharedCopyBuf).also { n = it } != -1) {
+                                                fos.write(sharedCopyBuf, 0, n)
+                                            }
                                         }
                                         val unixMode = entry.mode and 511
                                         val isExecutableDir = targetFile.parentFile?.name in listOf("bin", "libexec", "applets", "sbin")
@@ -1461,7 +1611,7 @@ object LocalEnvironmentManager {
                         }
 
                         extractedCount++
-                        if (extractedCount % 50 == 0) {
+                        if (extractedCount % 80 == 0) {
                             val fraction = (extractedCount.toFloat() / (extractedCount + 300).toFloat()).coerceIn(0.05f, 0.95f)
                             _installerState.value = LocalInstallerState.Extracting(
                                 extractedFilesCount = extractedCount,
@@ -1480,6 +1630,8 @@ object LocalEnvironmentManager {
                 val destDir = if (isUbuntuMode) getUbuntuRootDir(appContext) else prefixDir
                 log("Extracting rootfs files from ZIP into ${destDir.absolutePath}...")
                 val symlinksFromTxt = mutableListOf<Pair<String, String>>()
+                val createdDirs = HashSet<String>(512)
+                val sharedCopyBuf = ByteArray(128 * 1024)
                 CommonsZipFile(archiveToExtract).use { zip ->
                     val entriesList = zip.entries.toList()
                     val totalEntries = entriesList.size
@@ -1540,9 +1692,10 @@ object LocalEnvironmentManager {
                             if (entry.isUnixSymlink) {
                                 try {
                                     targetFile.parentFile?.let { p ->
-                                        if (!p.exists()) {
+                                        val pPath = p.absolutePath
+                                        if (createdDirs.add(pPath) && !p.exists()) {
                                             p.mkdirs()
-                                            try { Os.chmod(p.absolutePath, 493) } catch (_: Exception) {}
+                                            try { Os.chmod(pPath, 493) } catch (_: Exception) {}
                                         }
                                     }
                                     if (targetFile.exists() || isSymlink(targetFile)) {
@@ -1557,18 +1710,22 @@ object LocalEnvironmentManager {
                                     Log.w(TAG, "Failed creating embedded symlink for $rawName: ${e.message}")
                                 }
                             } else if (entry.isDirectory) {
-                                targetFile.mkdirs()
+                                val dirPath = targetFile.absolutePath
+                                if (createdDirs.add(dirPath)) {
+                                    targetFile.mkdirs()
+                                }
                                 val dirMode = if (unixMode != 0) unixMode else 493 // 0755
                                 try {
-                                    Os.chmod(targetFile.absolutePath, if (isUbuntuMode) dirMode or 448 else dirMode)
+                                    Os.chmod(dirPath, if (isUbuntuMode) dirMode or 448 else dirMode)
                                 } catch (e: Exception) {
                                     Log.w(TAG, "chmod failed on directory ${targetFile.name}: ${e.message}")
                                 }
                             } else {
                                 targetFile.parentFile?.let { p ->
-                                    if (!p.exists()) {
+                                    val pPath = p.absolutePath
+                                    if (createdDirs.add(pPath) && !p.exists()) {
                                         p.mkdirs()
-                                        try { Os.chmod(p.absolutePath, 493) } catch (_: Exception) {}
+                                        try { Os.chmod(pPath, 493) } catch (_: Exception) {}
                                     }
                                 }
 
@@ -1582,7 +1739,10 @@ object LocalEnvironmentManager {
                                 try {
                                     zip.getInputStream(entry).use { inStream ->
                                         FileOutputStream(targetFile).use { fos ->
-                                            inStream.copyTo(fos)
+                                            var n: Int
+                                            while (inStream.read(sharedCopyBuf).also { n = it } != -1) {
+                                                fos.write(sharedCopyBuf, 0, n)
+                                            }
                                         }
                                     }
 
@@ -1610,7 +1770,7 @@ object LocalEnvironmentManager {
                         }
 
                         extractedCount++
-                        if (extractedCount % 20 == 0 || extractedCount == totalEntries) {
+                        if (extractedCount % 80 == 0 || extractedCount == totalEntries) {
                             val fraction = (extractedCount.toFloat() / totalEntries.toFloat()).coerceIn(0.05f, 0.95f)
                             _installerState.value = LocalInstallerState.Extracting(
                                 extractedFilesCount = extractedCount,
@@ -2367,7 +2527,8 @@ All files created here persist inside the application.
                 "--bind=/sys",
                 "--bind=/dev/urandom:/dev/random",
                 "--bind=${shmDir.absolutePath}:/dev/shm",
-                "--bind=${prootTmpDir.absolutePath}:/tmp"
+                "--bind=${prootTmpDir.absolutePath}:/tmp",
+                "--bind=${getBinDir(context).absolutePath}:/antigem/bin"
             )
             for ((fakeFile, guestPath) in sysdataBindings) {
                 cmdList.add("--bind=${fakeFile.absolutePath}:$guestPath")
@@ -2413,7 +2574,7 @@ All files created here persist inside the application.
             processBuilder.environment()["USER"] = "root"
             processBuilder.environment()["TERM"] = "xterm-256color"
             processBuilder.environment()["LANG"] = "C.UTF-8"
-            processBuilder.environment()["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            processBuilder.environment()["PATH"] = "/root/.local/bin:/root/.gemini/bin:/root/.antigravity/bin:/antigem/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             processBuilder.environment()["TMPDIR"] = "/tmp"
             processBuilder.environment()["DEBIAN_FRONTEND"] = "noninteractive"
             // processBuilder.environment()["PROOT_NO_SECCOMP"] = "1"

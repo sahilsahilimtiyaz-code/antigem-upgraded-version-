@@ -377,9 +377,10 @@ object LocalServerManager {
 
         val appContext = context.applicationContext
         ensureBridgeBinary(appContext)
-        // the bridge starts Claude Code through the app's launcher (--claude-bin)
+        // the bridge starts Claude Code and Antigravity through the app's launchers
         LocalEnvironmentManager.ensureGlibcEnvironment(appContext)
         LocalEnvironmentManager.ensureClaudeWrapper(appContext)
+        LocalEnvironmentManager.ensureAgyWrapper(appContext)
 
         val command = resolveServerCommand(appContext)
         if (command == null) {

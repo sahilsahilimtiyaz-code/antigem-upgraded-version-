@@ -136,21 +136,24 @@ fun MessageBubble(
         // Message Content Bubble
         if (isUser) {
             Column(horizontalAlignment = Alignment.End) {
-                Box(
-                    modifier = Modifier
-                        .widthIn(max = 320.dp)
-                        .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 16.dp, bottomEnd = 4.dp))
-                        .background(MaterialTheme.colorScheme.surfaceVariant)
-                        .clickable { showUserActions = !showUserActions }
-                        .padding(horizontal = 14.dp, vertical = 10.dp)
+                Surface(
+                    onClick = { showUserActions = !showUserActions },
+                    modifier = Modifier.widthIn(max = 328.dp),
+                    shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 20.dp, bottomEnd = 6.dp),
+                    color = com.example.gemini.theme.AppColors.userBubble,
+                    tonalElevation = 1.dp,
+                    border = BorderStroke(1.dp, com.example.gemini.theme.AppColors.border.copy(alpha = 0.6f))
                 ) {
-                    SelectionContainer {
-                        Text(
-                            text = message.content,
-                            fontSize = 15.sp,
-                            lineHeight = 22.sp,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
+                    Box(modifier = Modifier.padding(horizontal = 15.dp, vertical = 11.dp)) {
+                        SelectionContainer {
+                            Text(
+                                text = message.content,
+                                fontSize = 15.sp,
+                                lineHeight = 22.sp,
+                                letterSpacing = 0.1.sp,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
                     }
                 }
 

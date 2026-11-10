@@ -71,10 +71,28 @@ object AgyOkHttpClient {
                     }
                 }
 
-                val requestBuilder = chain.request().newBuilder()
+                val originalRequest = chain.request()
+                val updatedUrl = try {
+                    val parsedHub = java.net.URI(hubUrl)
+                    val hubScheme = parsedHub.scheme ?: originalRequest.url.scheme
+                    val hubHost = parsedHub.host ?: originalRequest.url.host
+                    val hubPort = if (parsedHub.port > 0) parsedHub.port else originalRequest.url.port
+                    originalRequest.url.newBuilder()
+                        .scheme(hubScheme)
+                        .host(hubHost)
+                        .port(hubPort)
+                        .build()
+                } catch (_: Exception) {
+                    originalRequest.url
+                }
+
+                val effectiveToken = token.ifBlank { "true" }
+                val requestBuilder = originalRequest.newBuilder()
+                    .url(updatedUrl)
                     .header("User-Agent", "antiGem-Android-Native")
                     .header("X-Grpc-Web", "1")
-                    .header(AuthPreferences.currentFramedHeader, token.ifBlank { "true" })
+                    .header(AuthPreferences.currentFramedHeader, effectiveToken)
+                    .header("x-codeium-csrf-token", effectiveToken)
                 AuthPreferences.edgeHeader()?.let { (n, v) -> requestBuilder.header(n, v) }
                 val request = requestBuilder.build()
 
@@ -83,7 +101,7 @@ object AgyOkHttpClient {
                 // Check for CSRF expiry (HTTP 401/403 or gRPC status 16 UNAUTHENTICATED)
                 val isCsrfError = response.code == 401 || response.code == 403 || response.header("grpc-status") == "16"
                 if (isCsrfError) {
-                    AgyCsrfManager.instance.notifyCsrfExpired(hubUrl, chain.request().url.encodedPath, usedToken = token)
+                    AgyCsrfManager.instance.notifyCsrfExpired(hubUrl, originalRequest.url.encodedPath, usedToken = token)
                 }
 
                 response

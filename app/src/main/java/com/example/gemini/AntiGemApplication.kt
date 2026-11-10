@@ -19,6 +19,7 @@ class AntiGemApplication : Application(), coil.ImageLoaderFactory {
      */
     override fun newImageLoader(): coil.ImageLoader {
         val client = okhttp3.OkHttpClient.Builder()
+            .connectionPool(okhttp3.ConnectionPool(16, 5, java.util.concurrent.TimeUnit.MINUTES))
             .addInterceptor { chain ->
                 val req = chain.request()
                 val bridge = com.example.gemini.data.preferences.AuthPreferences.currentBridgeHttpUrl.toHttpUrlOrNull()
@@ -32,7 +33,22 @@ class AntiGemApplication : Application(), coil.ImageLoaderFactory {
                 )
             }
             .build()
-        return coil.ImageLoader.Builder(this).okHttpClient(client).build()
+        return coil.ImageLoader.Builder(this)
+            .okHttpClient(client)
+            .memoryCache {
+                coil.memory.MemoryCache.Builder(this)
+                    .maxSizePercent(0.20)
+                    .build()
+            }
+            .diskCache {
+                coil.disk.DiskCache.Builder()
+                    .directory(cacheDir.resolve("image_cache"))
+                    .maxSizeBytes(64L * 1024 * 1024)
+                    .build()
+            }
+            .allowHardware(true)
+            .crossfade(150)
+            .build()
     }
 
     override fun onCreate() {

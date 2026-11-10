@@ -646,19 +646,19 @@ private fun StepRow(
 
 @Composable
 private fun StepProgress(fraction: Float) {
-    val animated by animateFloatAsState(fraction, animationSpec = tween(300, easing = LinearEasing), label = "stepProgress")
+    val animated by animateFloatAsState(fraction, animationSpec = tween(250, easing = FastOutSlowInEasing), label = "stepProgress")
     Row(verticalAlignment = Alignment.CenterVertically) {
         LinearProgressIndicator(
             progress = { animated },
             modifier = Modifier
                 .weight(1f)
-                .height(6.dp)
-                .clip(RoundedCornerShape(3.dp)),
-            color = ClaudeTerracotta,
+                .height(8.dp)
+                .clip(RoundedCornerShape(4.dp)),
+            color = MaterialTheme.colorScheme.primary,
             trackColor = AppColors.fill
         )
         Spacer(modifier = Modifier.width(10.dp))
-        Text("${(fraction * 100).toInt()}%", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = ClaudeTerracotta)
+        Text("${(fraction * 100).toInt()}%", fontSize = 12.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.primary)
     }
 }
 
@@ -678,12 +678,13 @@ private fun StepDetail(text: String, mono: Boolean = false) {
 @Composable
 private fun InstallerCard(tint: Color? = null, content: @Composable ColumnScope.() -> Unit) {
     Surface(
-        shape = RoundedCornerShape(20.dp),
+        shape = RoundedCornerShape(22.dp),
         color = tint?.copy(alpha = 0.08f) ?: AppColors.card,
-        border = BorderStroke(1.dp, tint?.copy(alpha = 0.35f) ?: AppColors.border.copy(alpha = 0.6f)),
+        tonalElevation = 2.dp,
+        border = BorderStroke(1.dp, tint?.copy(alpha = 0.35f) ?: AppColors.border.copy(alpha = 0.75f)),
         modifier = Modifier.fillMaxWidth()
     ) {
-        Column(modifier = Modifier.padding(18.dp), content = content)
+        Column(modifier = Modifier.padding(20.dp), content = content)
     }
 }
 

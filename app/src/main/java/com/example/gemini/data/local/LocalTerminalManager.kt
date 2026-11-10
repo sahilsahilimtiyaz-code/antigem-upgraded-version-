@@ -206,12 +206,13 @@ class LocalPtySession(
                 }
                 LocalEnvironmentManager.setupProotDistroUbuntuFixups(context, ubuntuDir)
 
+                val prootDefaultPath = "/root/.local/bin:/root/.gemini/bin:/root/.antigravity/bin:/antigem/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
                 val envWrapper = listOf(
                     "/usr/bin/env", "-i",
                     "HOME=/root",
                     "USER=root",
                     "LOGNAME=root",
-                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    "PATH=$prootDefaultPath",
                     "TERM=xterm-256color",
                     "COLORTERM=truecolor",
                     "LANG=C.UTF-8",
@@ -236,7 +237,7 @@ class LocalPtySession(
                         "HOME=/root",
                         "USER=root",
                         "LOGNAME=root",
-                        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                        "PATH=$prootDefaultPath",
                         "TERM=xterm-256color",
                         "COLORTERM=truecolor",
                         "LANG=C.UTF-8",
@@ -265,6 +266,7 @@ class LocalPtySession(
 
                 LocalEnvironmentManager.ensureGlibcEnvironment(context)
                 LocalEnvironmentManager.ensureClaudeWrapper(context)
+                LocalEnvironmentManager.ensureAgyWrapper(context)
                 LocalEnvironmentManager.ensureTermuxApiDispatcher(context)
 
                 val loginShellBinaries = arrayOf("login", "bash", "zsh", "fish", "sh")

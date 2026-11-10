@@ -257,10 +257,15 @@ val buildAgyIdeBridge = tasks.register<Exec>("buildAgyIdeBridge") {
   }
 
   workingDir = bridgeSourceDir.asFile
-  environment("GOOS", "android")
+  val currentPath = System.getenv("PATH") ?: "/usr/bin:/bin"
+  environment("PATH", "/usr/local/go/bin:/usr/local/bin:$currentPath")
+  // GOOS=linux with CGO_ENABLED=0 produces a static arm64 ELF that runs identically on Android/Termux/PRoot
+  // while avoiding Go's "android/arm64 requires external (cgo) linking" error.
+  environment("GOOS", "linux")
   environment("GOARCH", "arm64")
   environment("CGO_ENABLED", "0")
-  commandLine("go", "build", "-ldflags=-s -w", "-o", rawFile.absolutePath, "main.go")
+  val goBin = listOf("/usr/local/go/bin/go", "/usr/local/bin/go").firstOrNull { File(it).exists() } ?: "go"
+  commandLine(goBin, "build", "-ldflags=-s -w", "-o", rawFile.absolutePath, "main.go")
 }
 
 val compressAgyIdeBridge = tasks.register<Exec>("compressAgyIdeBridge") {
@@ -274,6 +279,8 @@ val compressAgyIdeBridge = tasks.register<Exec>("compressAgyIdeBridge") {
     File(binDir, "agy_ide_bridge").delete()
   }
 
+  val currentPath = System.getenv("PATH") ?: "/usr/bin:/bin"
+  environment("PATH", "/usr/local/bin:$currentPath")
   commandLine("sh", "-c", "xz -6 -T1 -c \"$1\" > \"$2\"", "sh", rawFile.absolutePath, File(binDir, "agy_ide_bridge.xz").absolutePath)
 }
 
@@ -304,6 +311,27 @@ val copyScriptsToAssets = tasks.register<Copy>("copyScriptsToAssets") {
 
 tasks.named("preBuild") {
   dependsOn(compressAgyIdeBridge, copyScriptsToAssets)
+}
+
+afterEvaluate {
+  val copyDebugApkToStandardOutput: () -> Unit = {
+    val buildDirFile = layout.buildDirectory.get().asFile
+    val targetApk = File(buildDirFile, "outputs/apk/debug/app-debug.apk")
+    val candidates = listOf(
+      File(buildDirFile, "outputs/apk/standard/debug/antiGem-standard-debug.apk"),
+      File(buildDirFile, "outputs/apk/termux/debug/antiGem-termux-debug.apk"),
+      File(buildDirFile, "outputs/apk/termuxShared/debug/antiGem-termuxShared-debug.apk")
+    ).filter { it.exists() }.sortedByDescending { it.lastModified() }
+    candidates.firstOrNull()?.let { sourceApk ->
+      targetApk.parentFile.mkdirs()
+      sourceApk.copyTo(targetApk, overwrite = true)
+    }
+  }
+  listOf("assembleStandardDebug", "assembleTermuxDebug", "assembleTermuxSharedDebug", "assembleDebug").forEach { taskName ->
+    tasks.findByName(taskName)?.doLast {
+      copyDebugApkToStandardOutput()
+    }
+  }
 }
 
 

@@ -623,14 +623,16 @@ fun ChatInputBar(
                 modifier = Modifier.padding(bottom = 6.dp)
             )
 
-            // Claude-style unified rounded input card
+            // Unified elevated rounded input card
             Surface(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(24.dp),
+                shape = RoundedCornerShape(26.dp),
                 color = com.example.gemini.theme.AppColors.card,
+                tonalElevation = 2.dp,
+                shadowElevation = if (isDark) 6.dp else 3.dp,
                 border = BorderStroke(
                     1.dp,
-                    if (isDark) Color.White.copy(alpha = 0.08f) else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                    com.example.gemini.theme.AppColors.border.copy(alpha = if (isDark) 0.85f else 0.7f)
                 )
             ) {
                 if (isRecordingAudio) {

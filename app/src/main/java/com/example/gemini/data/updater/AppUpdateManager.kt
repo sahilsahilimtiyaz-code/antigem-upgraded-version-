@@ -40,8 +40,13 @@ sealed class DownloadState {
 class AppUpdateManager(private val context: Context) {
 
     private val httpClient = OkHttpClient.Builder()
+        .connectionPool(okhttp3.ConnectionPool(16, 5, TimeUnit.MINUTES))
+        .protocols(listOf(okhttp3.Protocol.HTTP_2, okhttp3.Protocol.HTTP_1_1))
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .retryOnConnectionFailure(true)
         .build()
 
 
@@ -158,41 +163,47 @@ class AppUpdateManager(private val context: Context) {
                 .header("User-Agent", "antiGem-Updater/${BuildConfig.VERSION_NAME}")
                 .build()
 
-            val response = httpClient.newCall(request).execute()
-            if (!response.isSuccessful) {
-                return@withContext Result.failure(Exception("Download failed: HTTP ${response.code}"))
-            }
-
-            val body = response.body ?: return@withContext Result.failure(Exception("Empty download body"))
-            val totalBytes = body.contentLength()
-
-            val targetDir = context.externalCacheDir ?: context.cacheDir
-            val targetFile = File(targetDir, "antiGem_update_${System.currentTimeMillis()}.apk")
-
-            body.byteStream().use { input ->
-                targetFile.outputStream().use { output ->
-                    val buffer = ByteArray(32 * 1024)
-                    var bytesRead: Int
-                    var downloadedBytes = 0L
-
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        output.write(buffer, 0, bytesRead)
-                        downloadedBytes += bytesRead
-
-                        val progress = if (totalBytes > 0) {
-                            (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
-                        } else {
-                            0f
-                        }
-                        withContext(Dispatchers.Main) {
-                            onProgress(progress, downloadedBytes, totalBytes)
-                        }
-                    }
-                    output.flush()
+            httpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(Exception("Download failed: HTTP ${response.code}"))
                 }
-            }
 
-            Result.success(targetFile)
+                val body = response.body ?: return@withContext Result.failure(Exception("Empty download body"))
+                val totalBytes = body.contentLength()
+
+                val targetDir = context.externalCacheDir ?: context.cacheDir
+                val targetFile = File(targetDir, "antiGem_update_${System.currentTimeMillis()}.apk")
+
+                body.byteStream().use { input ->
+                    java.io.BufferedOutputStream(targetFile.outputStream(), 256 * 1024).use { output ->
+                        val buffer = ByteArray(256 * 1024)
+                        var bytesRead: Int
+                        var downloadedBytes = 0L
+                        var lastProgressReportTime = 0L
+
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            output.write(buffer, 0, bytesRead)
+                            downloadedBytes += bytesRead
+
+                            val now = System.currentTimeMillis()
+                            if (now - lastProgressReportTime >= 100L || (totalBytes > 0 && downloadedBytes >= totalBytes)) {
+                                lastProgressReportTime = now
+                                val progress = if (totalBytes > 0) {
+                                    (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
+                                } else {
+                                    0f
+                                }
+                                withContext(Dispatchers.Main) {
+                                    onProgress(progress, downloadedBytes, totalBytes)
+                                }
+                            }
+                        }
+                        output.flush()
+                    }
+                }
+
+                Result.success(targetFile)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Download APK error: ${e.message}", e)
             Result.failure(e)

@@ -90,6 +90,16 @@ func FindAllAgyBinaries() []string {
 	if prefix := os.Getenv("PREFIX"); prefix != "" {
 		rawCandidates = append(rawCandidates, filepath.Join(prefix, "bin", "agy"))
 	}
+	rawCandidates = append(rawCandidates,
+		"/root/.local/bin/agy",
+		"/root/.gemini/bin/agy",
+		"/root/.antigravity/bin/agy",
+		"/antigem/bin/agy",
+		"/usr/local/bin/agy",
+		"/usr/bin/agy",
+		"/data/data/com.termux/files/home/.local/bin/agy",
+		"/data/data/com.termux/files/usr/bin/agy",
+	)
 	if p := config.SafeLookPath("agy"); p != "" {
 		rawCandidates = append(rawCandidates, p)
 	}
@@ -128,6 +138,9 @@ func ResolveAgyBinaryInteractive(customPath string, forceAuto bool) (string, err
 		}
 		cleanPath = filepath.Clean(cleanPath)
 		if fi, err := os.Stat(cleanPath); err != nil || fi.IsDir() {
+			if bins := FindAllAgyBinaries(); len(bins) > 0 {
+				return bins[0], nil
+			}
 			return "", fmt.Errorf("specified AGY binary not found at '%s' (resolved: '%s')", customPath, cleanPath)
 		}
 		return cleanPath, nil
@@ -192,21 +205,47 @@ func ResolveAgyBinary() string {
 }
 
 // ResolvePatchTarget determines the target binary for CSRF header patching.
-// If the selected binary is < 10 MB (wrapper script), it checks for agy.va39 in the same directory.
+// If the selected binary is < 10 MB (wrapper script), it checks for companion ELF binaries (agy.va39, agy.real, etc.).
 func ResolvePatchTarget(binPath string) string {
 	if binPath == "" {
 		return ""
+	}
+	if realPath, err := filepath.EvalSymlinks(binPath); err == nil && realPath != "" {
+		if fi, err2 := os.Stat(realPath); err2 == nil && !fi.IsDir() && fi.Size() >= 10*1024*1024 {
+			return realPath
+		}
 	}
 	fi, err := os.Stat(binPath)
 	if err == nil && fi.Size() >= 10*1024*1024 {
 		return binPath
 	}
 
-	// If < 10 MB, search in same directory for agy.va39
+	// If < 10 MB, search in same directory for companion binaries
 	dir := filepath.Dir(binPath)
-	companion := filepath.Join(dir, "agy.va39")
-	if fi2, err2 := os.Stat(companion); err2 == nil && !fi2.IsDir() && fi2.Size() >= 10*1024*1024 {
-		return companion
+	for _, name := range []string{"agy.va39", "agy.real", ".agy-real", "agy-linux-arm64", "agy-linux-aarch64"} {
+		companion := filepath.Join(dir, name)
+		if fi2, err2 := os.Stat(companion); err2 == nil && !fi2.IsDir() && fi2.Size() >= 10*1024*1024 {
+			return companion
+		}
+	}
+
+	// Also check ~/.local/bin/agy.real or ~/.local/share/antigravity if binPath is a wrapper in $PREFIX/bin
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		for _, cand := range []string{
+			filepath.Join(home, ".local", "bin", "agy.real"),
+			filepath.Join(home, ".local", "bin", "agy.va39"),
+			filepath.Join(home, ".local", "bin", "agy"),
+			filepath.Join(home, ".antigravity", "bin", "agy"),
+		} {
+			if fi2, err2 := os.Stat(cand); err2 == nil && !fi2.IsDir() && fi2.Size() >= 10*1024*1024 {
+				return cand
+			}
+		}
+	}
+
+	// If binPath is a small wrapper script, do not attempt to binary-patch the shell script itself
+	if err == nil && fi.Size() < 1024*1024 {
+		return ""
 	}
 
 	return binPath
@@ -254,7 +293,7 @@ func (m *HubManager) isHubReady() bool {
 func (m *HubManager) FetchCsrfToken() string {
 	url := fmt.Sprintf("http://127.0.0.1:%s/", m.HubPort)
 	client := &http.Client{
-		Timeout: 1 * time.Second,
+		Timeout: 1500 * time.Millisecond,
 	}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -269,6 +308,14 @@ func (m *HubManager) FetchCsrfToken() string {
 		return ""
 	}
 	defer resp.Body.Close()
+
+	if m.SecurityToken != "" {
+		framed := security.BuildFramedHeader(m.SecurityToken)
+		if headerToken := strings.TrimSpace(resp.Header.Get(framed)); headerToken != "" {
+			log.Printf("[FetchCsrfToken] Found token in framed header (%s): %s", framed, headerToken)
+			return headerToken
+		}
+	}
 
 	if headerToken := strings.TrimSpace(resp.Header.Get("x-codeium-csrf-token")); headerToken != "" {
 		log.Printf("[FetchCsrfToken] Found token in header: %s", headerToken)
@@ -445,37 +492,41 @@ func (m *HubManager) Start() error {
 	m.setStatusLocked(HubStatusStarting, "")
 
 	if m.AgyBinPath == "" {
-		err := fmt.Errorf("AGY executable binary not specified or found")
-		m.setStatusLocked(HubStatusError, err.Error())
-		m.mu.Unlock()
-		return err
-	}
-	// the app names the agy to use even before it is installed (Settings → Antigravity CLI → Install)
-	if fi, statErr := os.Stat(m.AgyBinPath); statErr != nil || fi.IsDir() {
-		err := fmt.Errorf("agy is not installed at %s (install it in the app: Settings → Antigravity CLI)", m.AgyBinPath)
-		m.setStatusLocked(HubStatusError, err.Error())
-		m.mu.Unlock()
-		return err
-	}
-
-	// In-place patch AGY binary with 20-byte framed security header (Strict Fail-Closed Security)
-	if m.SecurityToken != "" {
-		patchTarget := ResolvePatchTarget(m.AgyBinPath)
-		if patchTarget == "" {
-			err := fmt.Errorf("AGY executable binary not found for security header patching")
+		if bins := FindAllAgyBinaries(); len(bins) > 0 {
+			m.AgyBinPath = bins[0]
+			m.agyBinShadow.Store(bins[0])
+		} else {
+			err := fmt.Errorf("AGY executable binary not specified or found")
 			m.setStatusLocked(HubStatusError, err.Error())
 			m.mu.Unlock()
 			return err
 		}
-		patchedHeader, elapsed, err := security.PatchAgyHeader(patchTarget, m.SecurityToken)
-		if err != nil {
-			errMsg := fmt.Sprintf("Security Error: Failed to patch AGY binary (%s): %v", patchTarget, err)
-			log.Printf("\033[1;31m[Security Fatal]\033[0m %s", errMsg)
-			m.setStatusLocked(HubStatusError, errMsg)
+	}
+	// the app names the agy to use even before it is installed (Settings → Antigravity CLI → Install)
+	if fi, statErr := os.Stat(m.AgyBinPath); statErr != nil || fi.IsDir() {
+		if bins := FindAllAgyBinaries(); len(bins) > 0 {
+			log.Printf("[Hub] Configured AGY path %s not found; auto-switched to discovered binary %s", m.AgyBinPath, bins[0])
+			m.AgyBinPath = bins[0]
+			m.agyBinShadow.Store(bins[0])
+		} else {
+			err := fmt.Errorf("agy is not installed at %s (install it in the app: Settings → Antigravity CLI)", m.AgyBinPath)
+			m.setStatusLocked(HubStatusError, err.Error())
 			m.mu.Unlock()
-			return errors.New(errMsg)
+			return err
 		}
-		log.Printf("\033[1;32m[Security]\033[0m In-place patched AGY binary (%s) in %v -> Active Header: %s", patchTarget, elapsed, patchedHeader)
+	}
+
+	// In-place patch AGY binary with 20-byte framed security header when target binary is patchable
+	if m.SecurityToken != "" {
+		patchTarget := ResolvePatchTarget(m.AgyBinPath)
+		if patchTarget != "" {
+			patchedHeader, elapsed, err := security.PatchAgyHeader(patchTarget, m.SecurityToken)
+			if err != nil {
+				log.Printf("\033[1;33m[Security Warning]\033[0m Could not patch AGY binary (%s): %v (continuing with standard CSRF header fallback)", patchTarget, err)
+			} else {
+				log.Printf("\033[1;32m[Security]\033[0m In-place patched AGY binary (%s) in %v -> Active Header: %s", patchTarget, elapsed, patchedHeader)
+			}
+		}
 	}
 
 	args := []string{
@@ -505,23 +556,59 @@ func (m *HubManager) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 
-	shArgs := append([]string{"-c", `exec "$0" "$@"`, m.AgyBinPath}, args...)
-	cmd := exec.CommandContext(ctx, "sh", shArgs...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	// Set required environment variables for agy hub mode dynamically across all platforms
 	home, _ := os.UserHomeDir()
 	geminiBin := filepath.Join(home, ".gemini", "bin")
 	localBin := filepath.Join(home, ".local", "bin")
+	antigravityBin := filepath.Join(home, ".antigravity", "bin")
 	usrBin := filepath.Join(home, "..", "usr", "bin")
-	if prefix := os.Getenv("PREFIX"); prefix != "" {
+	prefix := os.Getenv("PREFIX")
+	if prefix != "" {
 		usrBin = filepath.Join(prefix, "bin")
 	}
 
-	cmd.Env = append(os.Environ(),
+	// On Termux (where /lib/ld-linux-aarch64.so.1 does not exist), if AgyBinPath is a raw ELF binary,
+	// run it through the bundled glibc loader ($PREFIX/glibc/lib/ld-linux-aarch64.so.1) automatically.
+	var cmd *exec.Cmd
+	usedGlibcLoader := false
+	if _, sysLoaderErr := os.Stat("/lib/ld-linux-aarch64.so.1"); sysLoaderErr != nil {
+		glibcBase := filepath.Join(home, "..", "usr", "glibc", "lib")
+		if prefix != "" {
+			glibcBase = filepath.Join(prefix, "glibc", "lib")
+		}
+		glibcLoader := filepath.Join(glibcBase, "ld-linux-aarch64.so.1")
+		if st, err := os.Stat(glibcLoader); err == nil && !st.IsDir() {
+			if f, err := os.Open(m.AgyBinPath); err == nil {
+				var magic [4]byte
+				_, _ = io.ReadFull(f, magic[:])
+				_ = f.Close()
+				if magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F' {
+					loaderArgs := append([]string{"--library-path", glibcBase, m.AgyBinPath}, args...)
+					cmd = exec.CommandContext(ctx, glibcLoader, loaderArgs...)
+					usedGlibcLoader = true
+					log.Printf("[Hub] Launching ELF %s via Termux glibc loader %s", m.AgyBinPath, glibcLoader)
+				}
+			}
+		}
+	}
+
+	if !usedGlibcLoader {
+		shArgs := append([]string{"-c", `exec "$0" "$@"`, m.AgyBinPath}, args...)
+		cmd = exec.CommandContext(ctx, "sh", shArgs...)
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	baseEnv := make([]string, 0, len(os.Environ())+12)
+	for _, kv := range os.Environ() {
+		if usedGlibcLoader && strings.HasPrefix(kv, "LD_PRELOAD=") {
+			continue // Never preload bionic libtermux-exec.so into a glibc process
+		}
+		baseEnv = append(baseEnv, kv)
+	}
+
+	cmd.Env = append(baseEnv,
 		"HOME="+home,
 		"USERPROFILE="+home,
-		"PATH="+geminiBin+":"+localBin+":"+usrBin+":/usr/local/bin:/usr/bin:/bin:/system/bin:/system/xbin:"+os.Getenv("PATH"),
+		"PATH="+geminiBin+":"+localBin+":"+antigravityBin+":"+usrBin+":/antigem/bin:/root/.local/bin:/root/.gemini/bin:/root/.antigravity/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/system/bin:/system/xbin:"+os.Getenv("PATH"),
 		"AGY_ENABLE_HUB=1",
 		"ANTIGRAVITY_VSCODE_HOST=1",
 		"ANTIGRAVITY_AUTH_SUCCESS_APP=vscode",
@@ -537,7 +624,7 @@ func (m *HubManager) Start() error {
 		cancel()
 		m.setStatusLocked(HubStatusError, err.Error())
 		m.mu.Unlock()
-		return fmt.Errorf("failed to start agy hub via sh: %w", err)
+		return fmt.Errorf("failed to start agy hub: %w", err)
 	}
 
 	m.cmd = cmd
