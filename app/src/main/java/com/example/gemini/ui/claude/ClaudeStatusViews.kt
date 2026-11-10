@@ -151,10 +151,10 @@ fun ClaudeStartupNotice(text: String, modifier: Modifier = Modifier) {
         border = BorderStroke(1.dp, ClaudeAccent.copy(alpha = 0.3f))
     ) {
         Row(Modifier.padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
-            androidx.compose.material3.CircularProgressIndicator(
-                modifier = Modifier.padding(end = 10.dp).size(14.dp),
-                strokeWidth = 2.dp,
-                color = ClaudeAccent
+            com.example.gemini.ui.components.AgentInlinePulse(
+                color = ClaudeAccent,
+                diameter = 14.dp,
+                modifier = Modifier.padding(end = 10.dp)
             )
             androidx.compose.foundation.layout.Column(Modifier.weight(1f)) {
                 Text(text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)

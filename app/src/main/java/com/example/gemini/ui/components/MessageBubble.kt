@@ -50,6 +50,7 @@ import com.example.gemini.data.remote.HubMediaResolver
 import kotlinx.coroutines.launch
 import com.example.gemini.domain.model.ChatMessage
 import com.example.gemini.domain.model.MessageRole
+import com.example.gemini.theme.AppColors
 import com.example.gemini.theme.ClaudeTerracotta
 import com.example.gemini.theme.GeminiBlue
 import androidx.compose.material.icons.rounded.HeadsetMic
@@ -76,6 +77,8 @@ fun MessageBubble(
     artifactsCount: Int = 0,
     summarizingModelName: String = "AI",
     pendingQueuedUserMessage: String? = null,
+    /** The working agent's accent, so its thinking block keeps the same identity as its activity row. */
+    agentAccent: Color? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -116,14 +119,17 @@ fun MessageBubble(
             ),
         horizontalAlignment = if (isUser) Alignment.End else Alignment.Start
     ) {
-        val hasActiveRunningTool = message.toolCalls.any { it.status == "RUNNING" || it.status == "PENDING_APPROVAL" || it.status == "AWAITING_CHOICE" }
+        val hasActiveRunningTool = remember(message.toolCalls) {
+            message.toolCalls.any { it.status == "RUNNING" || it.status == "PENDING_APPROVAL" || it.status == "AWAITING_CHOICE" }
+        }
 
         // Thinking block (for assistant responses)
         if (!isUser && !message.thoughtText.isNullOrEmpty()) {
             ThinkingAccordion(
                 thoughtText = message.thoughtText,
                 durationMs = message.thoughtDurationMs,
-                isStreaming = message.isStreaming && !hasActiveRunningTool
+                isStreaming = message.isStreaming && !hasActiveRunningTool,
+                accent = agentAccent ?: AppColors.primary
             )
             Spacer(modifier = Modifier.height(4.dp))
         }
@@ -258,7 +264,7 @@ fun MessageBubble(
                     }
 
                 } else if (message.isStreaming && !hasActiveRunningTool && message.content.isEmpty() && message.thoughtText.isNullOrEmpty() && message.toolCalls.isEmpty()) {
-                    ModelTypingIndicator(modelId = modelId)
+                    ModelTypingIndicator(modelId = modelId, accent = agentAccent ?: AppColors.primary)
                 }
 
                 // Token Telemetry and Action Icons (Copy, Retry, Raw Payload, Artifacts)
@@ -368,9 +374,10 @@ fun UserMessageBubble(
     var showUserActions by remember { mutableStateOf(false) }
     var previewImageUrl by remember { mutableStateOf<String?>(null) }
 
-    if (previewImageUrl != null) {
+    // Read through a local: no forced unwrap can race a dismissal.
+    previewImageUrl?.let { preview ->
         FullScreenImageDialog(
-            imageUrl = previewImageUrl!!,
+            imageUrl = preview,
             title = "Image Preview",
             onDismiss = { previewImageUrl = null }
         )
@@ -736,7 +743,7 @@ fun AssistantMessageFooter(
 }
 
 private val WAITING_PHRASES = listOf(
-    "Consulting AGY",
+    "Weighing options",
     "Cooking response",
     "Crafting answer",
     "Gathering context",
@@ -750,6 +757,7 @@ private val WAITING_PHRASES = listOf(
 @Composable
 fun ModelTypingIndicator(
     modelId: String,
+    accent: Color = AppColors.primary,
     modifier: Modifier = Modifier
 ) {
     var phraseIndex by remember { mutableIntStateOf(0) }
@@ -767,20 +775,20 @@ fun ModelTypingIndicator(
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(16.dp),
-        color = ClaudeTerracotta.copy(alpha = 0.08f),
-        border = BorderStroke(1.dp, ClaudeTerracotta.copy(alpha = 0.22f))
+        color = accent.copy(alpha = 0.08f),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.22f))
     ) {
         Box(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
             contentAlignment = Alignment.CenterStart
         ) {
-            WaitingDotsText(phrase = phrase)
+            WaitingDotsText(phrase = phrase, color = accent)
         }
     }
 }
 
 @Composable
-private fun WaitingDotsText(phrase: String) {
+private fun WaitingDotsText(phrase: String, color: Color) {
     val dots by produceState(initialValue = ".") {
         var count = 1
         while (true) {
@@ -794,7 +802,7 @@ private fun WaitingDotsText(phrase: String) {
         text = "$phrase$dots",
         fontSize = 12.5.sp,
         fontWeight = FontWeight.SemiBold,
-        color = ClaudeTerracotta,
+        color = color,
         letterSpacing = 0.2.sp
     )
 }
@@ -995,17 +1003,18 @@ private fun UserMessageImageItem(
         }
     }
     val memKey = remember(rawUri) { HubMediaResolver.normalizeKey(rawUri) }
-    var resolvedUri by remember(rawUri) {
-        mutableStateOf(if (rawUri.isNotBlank()) HubMediaResolver.getResolvedUriSync(context, rawUri) else "")
-    }
+    // Resolve off the composition and guard it: a bad attachment could otherwise throw while a message is drawn.
+    var resolvedUri by remember(rawUri) { mutableStateOf("") }
 
     LaunchedEffect(rawUri) {
-        if (rawUri.isNotBlank() && !HubMediaResolver.isLocalOrCached(context, rawUri)) {
-            val res = HubMediaResolver.resolveMediaUri(context, rawUri)
-            if (res.isNotBlank()) {
-                resolvedUri = res
+        if (rawUri.isBlank()) return@LaunchedEffect
+        resolvedUri = runCatching {
+            if (HubMediaResolver.isLocalOrCached(context, rawUri)) {
+                HubMediaResolver.getResolvedUriSync(context, rawUri)
+            } else {
+                HubMediaResolver.resolveMediaUri(context, rawUri)
             }
-        }
+        }.getOrDefault("")
     }
 
     // a bridge file needs the authenticated fetch above; Coil alone would be refused
@@ -1073,8 +1082,9 @@ private fun UserMessageImagesGrid(
     if (attachments.isEmpty()) return
 
     if (attachments.size == 1) {
+        val only = attachments.firstOrNull() ?: return
         UserMessageImageItem(
-            attachment = attachments.first(),
+            attachment = only,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(180.dp),

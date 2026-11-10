@@ -259,12 +259,14 @@ fun AgentStatusDot(top: Color, bottom: Color?, modifier: Modifier = Modifier, si
  */
 @Composable
 fun AgentStatusDot(colors: List<Color>, modifier: Modifier = Modifier, size: Dp = 11.dp, pulsing: Boolean = false) {
+    // The pulse is read inside the graphics layer, not during composition: a frame repaints this dot and nothing
+    // else, so the top bar stays cheap while any of the four agents starts, checks or signs in.
     val alpha = if (pulsing) {
         val transition = rememberInfiniteTransition(label = "agent_dot")
-        transition.animateFloat(1f, 0.4f, infiniteRepeatable(tween(850), RepeatMode.Reverse), label = "agent_dot_alpha").value
-    } else 1f
+        transition.animateFloat(1f, 0.4f, infiniteRepeatable(tween(850), RepeatMode.Reverse), label = "agent_dot_alpha")
+    } else null
     val slices = colors.ifEmpty { listOf(SystemStatus.OFFLINE.dotColor) }
-    Canvas(modifier.size(size).graphicsLayer { this.alpha = alpha }) {
+    Canvas(modifier.size(size).graphicsLayer { this.alpha = alpha?.value ?: 1f }) {
         when {
             slices.distinct().size == 1 -> drawCircle(slices.first())
             slices.size == 2 -> {

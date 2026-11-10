@@ -1,0 +1,84 @@
+name: Termux Debug APK
+
+# Scratch-branch workflow: builds the app exactly as the Termux debug variant, without
+# touching the release workflow in release.yml. Push to this branch to get a fresh APK.
+on:
+  push:
+    branches:
+      - ci/termux-debug-apk
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: termux-debug-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: agy_ide_bridge/go.mod
+          cache-dependency-path: agy_ide_bridge/go.sum
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Termux Debug APK
+        run: |
+          set -o pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleTermuxDebug --stacktrace --console=plain 2>&1 | tee gradle-build.log
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: antigem-termux-debug
+          path: app/build/outputs/apk/termux/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload Build Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-log
+          path: gradle-build.log
+
+      - name: Summarize Build Failure
+        if: failure()
+        run: |
+          echo '## Gradle failure' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -n 150 gradle-build.log >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # Public repositories do not expose Actions logs to unauthenticated clients, so on failure the
+      # tail of the Gradle log is committed to this branch for the agent to read.
+      - name: Record Build Failure
+        if: failure()
+        continue-on-error: true
+        run: |
+          tail -c 150000 gradle-build.log > ci-build-failure.log || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f ci-build-failure.log
+          git commit -m "ci: record termux debug build failure [skip ci]"
+          git push origin HEAD:ci/termux-debug-apk

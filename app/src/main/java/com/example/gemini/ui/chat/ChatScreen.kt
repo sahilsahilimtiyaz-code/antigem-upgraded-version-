@@ -98,6 +98,7 @@ import com.example.gemini.ui.components.parseMarkdownBlocks
 import com.example.gemini.ui.components.UserMessageBubble
 import com.example.gemini.ui.components.AssistantMessageFooter
 import com.example.gemini.ui.components.ThinkingAccordion
+import com.example.gemini.ui.components.accent
 import com.example.gemini.ui.components.ConnectionStatusBadge
 import com.example.gemini.ui.components.FileLinkHandler
 import com.example.gemini.ui.components.LocalFileLinkHandler
@@ -1013,6 +1014,10 @@ fun ChatScreen(
     val waitingForUser = (isClaudeChat && claudePending.isNotEmpty()) || (isOpenCodeChat && openCodePending.isNotEmpty()) || (isCodexChat && codexPending.isNotEmpty()) ||
         lastToolCalls.any { it.status == "PENDING_APPROVAL" || it.status == "AWAITING_CHOICE" }
     val showWorkingRow = (isRunningOrStreaming || holdingTail) && !waitingForUser && !footerShown
+    // The live line in the working row: whatever the reply's current tool is actually doing.
+    val runningActivityHint = remember(lastToolCalls) {
+        com.example.gemini.ui.components.toolActivityHint(lastToolCalls.lastOrNull { it.status == "RUNNING" })
+    }
 
     val currentModel = if (isClaudeChat) {
         claudeModelList.find { it.id == selectedModelId } ?: AiModel(
@@ -1340,8 +1345,9 @@ fun ChatScreen(
         }
     ) {
         com.example.gemini.ui.agents.BridgeVersionDialog()
-        if (pendingLoginUrl != null) {
-            val targetUrl = pendingLoginUrl!!
+        val pendingLogin = pendingLoginUrl
+        if (pendingLogin != null) {
+            val targetUrl = pendingLogin
             val remoteSignIn = AuthPreferences.currentRemoteMode
             var pastedCallback by remember(targetUrl) { mutableStateOf("") }
             var callbackStatus by remember(targetUrl) { mutableStateOf<String?>(null) }
@@ -2150,7 +2156,8 @@ fun ChatScreen(
                                                 ThinkingAccordion(
                                                     thoughtText = feedItem.thoughtText,
                                                     durationMs = feedItem.durationMs,
-                                                    isStreaming = feedItem.isStreaming
+                                                    isStreaming = feedItem.isStreaming,
+                                                    accent = currentConv?.agent?.accent() ?: com.example.gemini.theme.AppColors.primary
                                                 )
                                             }
                                         }
@@ -2207,6 +2214,7 @@ fun ChatScreen(
                                             MessageBubble(
                                                 message = feedItem.message,
                                                 modelId = selectedModelId,
+                                                agentAccent = currentConv?.agent?.accent(),
                                                 isDevModeEnabled = isDevModeEnabled,
                                                 onApproveTool = { toolCall, msgId ->
                                                     viewModel.approveAndExecuteTerminalTool(toolCall, msgId)
@@ -2240,6 +2248,8 @@ fun ChatScreen(
                                         item(key = "working_spinner", contentType = "working_spinner") {
                                             com.example.gemini.ui.components.AgentWorkingSpinner(
                                                 color = if (isClaudeChat) com.example.gemini.ui.components.ClaudeAccent else if (isOpenCodeChat) com.example.gemini.ui.components.OpenCodeAccent else if (isCodexChat) com.example.gemini.ui.components.CodexAccent else com.example.gemini.ui.components.AgyAccent,
+                                                agent = currentConv?.agent,
+                                                activityHint = runningActivityHint,
                                                 compacting = isClaudeChat && claudeCompacting,
                                                 // leaves in the frame the reply's footer arrives, which fades in in its place
                                                 modifier = Modifier.animateItem(fadeInSpec = tween(180), placementSpec = null, fadeOutSpec = null)
@@ -3389,9 +3399,10 @@ fun ChatScreen(
     }
 
     // Raw Request Payload Inspector Dialog (Developer Mode)
-    if (showRawPayloadDialog != null) {
+    val rawPayload = showRawPayloadDialog
+    if (rawPayload != null) {
         RawPayloadDialog(
-            payloadJson = showRawPayloadDialog!!,
+            payloadJson = rawPayload,
             onDismiss = { showRawPayloadDialog = null }
         )
     }

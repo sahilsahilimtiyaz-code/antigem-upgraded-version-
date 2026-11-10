@@ -27,7 +27,6 @@ import androidx.compose.material.icons.outlined.SmartToy
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.outlined.TravelExplore
 import androidx.compose.material.icons.outlined.VerifiedUser
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
@@ -148,7 +147,7 @@ fun OpenCodeControlsStrip(backend: OpenCodeChatBackend) {
     Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp)) {
         notice?.let {
             Row(Modifier.fillMaxWidth().padding(bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                CircularProgressIndicator(Modifier.size(11.dp), strokeWidth = 1.5.dp, color = OpenCodeAccent)
+                com.example.gemini.ui.components.AgentInlinePulse(color = OpenCodeAccent, diameter = 11.dp)
                 Spacer(Modifier.width(6.dp))
                 Text(it, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f), maxLines = 2, overflow = TextOverflow.Ellipsis)
             }

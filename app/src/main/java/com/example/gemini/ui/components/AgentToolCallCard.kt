@@ -8,6 +8,7 @@ import android.net.Uri
 import android.widget.Toast
 import androidx.compose.animation.*
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -32,6 +33,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -49,6 +51,15 @@ import com.example.gemini.domain.model.ToolType
 import com.example.gemini.theme.*
 
 private val IMAGE_FILE_REGEX = Regex(".*\\.(png|jpe?g|webp|gif)(\\?.*)?$", RegexOption.IGNORE_CASE)
+
+/** A runaway command can print megabytes; the card shows a bounded slice so opening it cannot lock up the chat. */
+private const val MAX_TOOL_OUTPUT_CHARS = 60_000
+
+private fun clippedToolOutput(output: String): String =
+    if (output.length <= MAX_TOOL_OUTPUT_CHARS) output
+    else output.take(MAX_TOOL_OUTPUT_CHARS) +
+        "\n\n… output truncated for display (" + (output.length - MAX_TOOL_OUTPUT_CHARS) +
+        " more characters; Copy gets the whole output)"
 
 /**
  * Clean, professional inline tool call component matching Cursor & Claude developer UI.
@@ -98,26 +109,30 @@ fun AgentToolCallCard(
         (toolCall.output.startsWith("file://") && toolCall.output.matches(IMAGE_FILE_REGEX))
     }
 
-    var resolvedImageUri by remember(toolCall.output) {
-        mutableStateOf(if (isImageOutput && toolCall.output.isNotBlank()) HubMediaResolver.getResolvedUriSync(context, toolCall.output) else "")
-    }
+    // Resolve off the composition: the old synchronous lookup ran disk checks while the chat was drawing, and a
+    // malformed media path could throw straight through the message list. Both now happen once, guarded, in an effect.
+    var resolvedImageUri by remember(toolCall.output) { mutableStateOf("") }
     var isResolvingImage by remember(toolCall.output) {
-        mutableStateOf(isImageOutput && toolCall.output.isNotBlank() && !HubMediaResolver.isLocalOrCached(context, toolCall.output))
+        mutableStateOf(isImageOutput && toolCall.output.isNotBlank())
     }
     var showFullScreenViewer by remember { mutableStateOf(false) }
 
     LaunchedEffect(toolCall.output, isImageOutput) {
-        if (isImageOutput && toolCall.output.isNotBlank()) {
-            if (!HubMediaResolver.isLocalOrCached(context, toolCall.output)) {
-                isResolvingImage = true
-                val res = HubMediaResolver.resolveMediaUri(context, toolCall.output)
-                if (res.isNotBlank()) resolvedImageUri = res
-                isResolvingImage = false
-            } else {
-                resolvedImageUri = HubMediaResolver.getResolvedUriSync(context, toolCall.output)
-                isResolvingImage = false
-            }
+        if (!isImageOutput || toolCall.output.isBlank()) {
+            isResolvingImage = false
+            return@LaunchedEffect
         }
+        isResolvingImage = true
+        resolvedImageUri = runCatching {
+            if (HubMediaResolver.isLocalOrCached(context, toolCall.output)) {
+                HubMediaResolver.getResolvedUriSync(context, toolCall.output)
+            } else {
+                HubMediaResolver.resolveMediaUri(context, toolCall.output)
+            }
+        }.getOrDefault("").ifBlank {
+            runCatching { HubMediaResolver.getResolvedUriSync(context, toolCall.output) }.getOrDefault("")
+        }
+        isResolvingImage = false
     }
 
     val isPendingApproval = toolCall.status == "PENDING_APPROVAL"
@@ -169,11 +184,38 @@ fun AgentToolCallCard(
         else -> MaterialTheme.colorScheme.onSurface
     }
 
+    val animatedActionColor by animateColorAsState(
+        targetValue = actionColor,
+        animationSpec = tween(durationMillis = 220),
+        label = "tool_action_color"
+    )
+
     val rotation by animateFloatAsState(
         targetValue = if (isExpanded) 90f else 0f,
-        animationSpec = tween(durationMillis = 180),
+        animationSpec = spring(dampingRatio = 0.58f, stiffness = 760f),
         label = "tool_chevron_rotation"
     )
+
+    val displayOutput = remember(toolCall.output) { clippedToolOutput(toolCall.output) }
+    val headerShape = remember { RoundedCornerShape(8.dp) }
+    // Keyed on the states (and theme colors) that change it: a streaming command does not allocate brushes per token.
+    val headerAccent = ClaudeTerracotta
+    val headerWarning = AppColors.warning
+    val headerSurface = MaterialTheme.colorScheme.surfaceVariant
+    val headerBrush = remember(isRunning, isPendingApproval, isExpanded, headerAccent, headerWarning, headerSurface) {
+        when {
+            isRunning -> Brush.horizontalGradient(
+                listOf(headerAccent.copy(alpha = 0.1f), headerAccent.copy(alpha = 0.025f), Color.Transparent)
+            )
+            isPendingApproval -> Brush.horizontalGradient(
+                listOf(headerWarning.copy(alpha = 0.12f), headerWarning.copy(alpha = 0.02f), Color.Transparent)
+            )
+            isExpanded -> Brush.horizontalGradient(
+                listOf(headerSurface.copy(alpha = 0.5f), Color.Transparent)
+            )
+            else -> Brush.horizontalGradient(listOf(Color.Transparent, Color.Transparent))
+        }
+    }
 
     Column(
         modifier = modifier
@@ -184,9 +226,10 @@ fun AgentToolCallCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(6.dp))
+                .clip(headerShape)
+                .background(headerBrush)
                 .clickable { ToolCallExpansionCache.setExpanded(toolCall, !isExpanded) }
-                .padding(horizontal = 4.dp, vertical = 5.dp),
+                .padding(horizontal = 5.dp, vertical = 5.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             // Frontend Expand Chevron (-> / rotating arrow)
@@ -216,48 +259,50 @@ fun AgentToolCallCard(
                 else -> Icons.Default.Terminal
             }
 
-            // Tool / State Icon
-            if (isPendingApproval) {
+            // Tool / State mark: a tinted disc, with a live pulse while the call is in flight.
+            val statusTint = when {
+                isPendingApproval -> AppColors.warning
+                isRunning -> ClaudeTerracotta
+                isSuccess -> QuotaGreen
+                isTerminated || isFailed -> AppColors.danger
+                isRejected -> MaterialTheme.colorScheme.onSurfaceVariant
+                else -> MaterialTheme.colorScheme.onSurfaceVariant
+            }
+            val statusIcon = when {
+                isPendingApproval -> Icons.Default.HourglassEmpty
+                isTerminated -> Icons.Default.Cancel
+                isRejected -> Icons.Default.Close
+                isFailed -> Icons.Default.Warning
+                else -> toolIcon
+            }
+            val statusDescription = when {
+                isPendingApproval -> "Pending approval"
+                isRunning -> "Running"
+                isSuccess -> "Done"
+                isTerminated -> "Terminated"
+                isRejected -> "Rejected"
+                isFailed -> "Failed"
+                else -> null
+            }
+            Box(
+                modifier = Modifier.size(18.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                if (isRunning) {
+                    AgentStatusPulse(color = statusTint, diameter = 18.dp)
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .size(18.dp)
+                            .clip(CircleShape)
+                            .background(statusTint.copy(alpha = 0.11f))
+                    )
+                }
                 Icon(
-                    imageVector = Icons.Default.HourglassEmpty,
-                    contentDescription = "Pending Approval",
-                    tint = com.example.gemini.theme.AppColors.warning,
-                    modifier = Modifier.size(14.dp)
-                )
-            } else if (isRunning) {
-                Icon(
-                    imageVector = toolIcon,
-                    contentDescription = "Running",
-                    tint = ClaudeTerracotta,
-                    modifier = Modifier.size(14.dp)
-                )
-            } else if (isSuccess) {
-                Icon(
-                    imageVector = toolIcon,
-                    contentDescription = null,
-                    tint = QuotaGreen,
-                    modifier = Modifier.size(14.dp)
-                )
-            } else if (isTerminated) {
-                Icon(
-                    imageVector = Icons.Default.Cancel,
-                    contentDescription = "Terminated",
-                    tint = com.example.gemini.theme.AppColors.danger,
-                    modifier = Modifier.size(14.dp)
-                )
-            } else if (isRejected) {
-                Icon(
-                    imageVector = Icons.Default.Close,
-                    contentDescription = "Rejected",
-                    tint = Color.Gray,
-                    modifier = Modifier.size(14.dp)
-                )
-            } else if (isFailed) {
-                Icon(
-                    imageVector = Icons.Default.Warning,
-                    contentDescription = "Failed",
-                    tint = Color.Red,
-                    modifier = Modifier.size(14.dp)
+                    imageVector = statusIcon,
+                    contentDescription = statusDescription,
+                    tint = statusTint,
+                    modifier = Modifier.size(11.dp)
                 )
             }
 
@@ -268,7 +313,7 @@ fun AgentToolCallCard(
                 text = actionPrefix,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold,
-                color = actionColor
+                color = animatedActionColor
             )
 
             Spacer(modifier = Modifier.width(6.dp))
@@ -324,14 +369,14 @@ fun AgentToolCallCard(
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(4.dp))
-                        .background(Color.Red.copy(alpha = 0.12f))
+                        .background(AppColors.danger.copy(alpha = 0.12f))
                         .padding(horizontal = 4.dp, vertical = 1.dp)
                 ) {
                     Text(
                         text = "stopped",
                         fontSize = 9.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color.Red
+                        color = AppColors.danger
                     )
                 }
             } else if (toolCall.exitCode != null && !isRunning && !isPendingApproval && !isRejected) {
@@ -408,11 +453,15 @@ fun AgentToolCallCard(
                                         .height(180.dp),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Text(
-                                        text = "Loading image...",
-                                        fontSize = 12.sp,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        AgentInlinePulse(color = ClaudeTerracotta, diameter = 11.dp)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "Preparing image…",
+                                            fontSize = 12.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
                                 }
                             } else {
                                 AsyncImage(
@@ -484,8 +533,10 @@ fun AgentToolCallCard(
         // Expanded Terminal / Tool Output
         AnimatedVisibility(
             visible = isExpanded,
-            enter = fadeIn() + expandVertically(),
-            exit = fadeOut() + shrinkVertically()
+            enter = fadeIn(animationSpec = tween(170)) +
+                expandVertically(animationSpec = spring(dampingRatio = 0.86f, stiffness = 420f)),
+            exit = fadeOut(animationSpec = tween(120)) +
+                shrinkVertically(animationSpec = spring(dampingRatio = 1f, stiffness = 620f))
         ) {
             Surface(
                 shape = RoundedCornerShape(8.dp),
@@ -585,7 +636,7 @@ fun AgentToolCallCard(
                         )
                     } else {
                         Text(
-                            text = toolCall.output,
+                            text = displayOutput,
                             fontFamily = FontFamily.Monospace,
                             fontSize = 11.sp,
                             lineHeight = 16.sp,
