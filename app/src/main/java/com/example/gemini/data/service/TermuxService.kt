@@ -148,10 +148,19 @@ open class TermuxService : Service(), LifecycleOwner, ViewModelStoreOwner, Saved
         super.onDestroy()
     }
 
+    private var isAutoWakeLock = false
+
     private fun observeTerminalSessions() {
         serviceScope.launch {
             LocalTerminalManager.sessions.collect { sessions ->
                 currentSessionCount = sessions.size
+                if (sessions.isNotEmpty() && wakeLock == null) {
+                    isAutoWakeLock = true
+                    actionAcquireWakeLock(silent = true)
+                } else if (sessions.isEmpty() && isAutoWakeLock) {
+                    isAutoWakeLock = false
+                    actionReleaseWakeLock()
+                }
                 updateNotification()
             }
         }
@@ -241,7 +250,7 @@ open class TermuxService : Service(), LifecycleOwner, ViewModelStoreOwner, Saved
     }
 
     @SuppressLint("WakelockTimeout")
-    private fun actionAcquireWakeLock() {
+    private fun actionAcquireWakeLock(silent: Boolean = false) {
         if (wakeLock != null) {
             Log.d(TAG, "Ignoring acquiring WakeLocks since they are already held")
             return
@@ -251,9 +260,9 @@ open class TermuxService : Service(), LifecycleOwner, ViewModelStoreOwner, Saved
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
             wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "termux:service-wakelock").apply {
                 setReferenceCounted(false)
-                acquire(60 * 60 * 1000L) // 1-hour maximum timeout
+                acquire(2 * 60 * 60 * 1000L) // 2-hour maximum timeout for heavy builds
             }
-            Log.d(TAG, "Acquired partial WakeLock (1-hour timeout)")
+            Log.d(TAG, "Acquired partial WakeLock (2-hour timeout)")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to acquire WakeLock: ${e.message}")
         }
@@ -271,8 +280,10 @@ open class TermuxService : Service(), LifecycleOwner, ViewModelStoreOwner, Saved
 
         requestDisableBatteryOptimizations(this)
         updateNotification()
-        Handler(Looper.getMainLooper()).post {
-            Toast.makeText(this@TermuxService, "Wake lock activated for 1 hour", Toast.LENGTH_SHORT).show()
+        if (!silent) {
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(this@TermuxService, "Wake lock activated for 2 hours", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 

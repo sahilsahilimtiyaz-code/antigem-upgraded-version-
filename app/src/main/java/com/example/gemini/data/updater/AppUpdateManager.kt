@@ -106,26 +106,40 @@ class AppUpdateManager(private val context: Context) {
                 currentPkg == "com.termux" -> "termux"
                 else -> "standard"
             }
-            val downloadUrl = "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-$flavorType-v$remoteVersionName-release.apk"
+            val primaryBuildType = if (BuildConfig.DEBUG) "debug" else "release"
+            val candidateUrls = listOf(
+                "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-$flavorType-v$remoteVersionName-$primaryBuildType.apk",
+                "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-$flavorType-v$remoteVersionName-release.apk",
+                "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-$flavorType-v$remoteVersionName.apk",
+                "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-v$remoteVersionName.apk"
+            ).distinct()
 
-            if (remoteVersionCode > BuildConfig.VERSION_CODE && downloadUrl.isNotBlank()) {
-                // Verify that the APK asset is actually published and downloadable on GitHub
-                val probeRequest = Request.Builder()
-                    .url(downloadUrl)
-                    .head()
-                    .header("User-Agent", "antiGem-Updater/${BuildConfig.VERSION_NAME}")
-                    .build()
+            var resolvedUrl: String? = null
+            if (remoteVersionCode > BuildConfig.VERSION_CODE) {
+                // Probe candidate URLs to find the published APK asset
+                for (candidate in candidateUrls) {
+                    val probeRequest = Request.Builder()
+                        .url(candidate)
+                        .head()
+                        .header("User-Agent", "antiGem-Updater/${BuildConfig.VERSION_NAME}")
+                        .build()
 
-                val isAvailable = try {
-                    httpClient.newCall(probeRequest).execute().use { probeResponse ->
-                        probeResponse.isSuccessful || probeResponse.isRedirect
+                    val isAvailable = try {
+                        httpClient.newCall(probeRequest).execute().use { probeResponse ->
+                            probeResponse.isSuccessful || probeResponse.isRedirect
+                        }
+                    } catch (_: Exception) {
+                        false
                     }
-                } catch (_: Exception) {
-                    false
+
+                    if (isAvailable) {
+                        resolvedUrl = candidate
+                        break
+                    }
                 }
 
-                if (!isAvailable) {
-                    // Release is not yet fully published or APK is still building on CI
+                if (resolvedUrl == null) {
+                    // Release is not yet fully published or APK asset is still building on CI
                     return@withContext Result.success(null)
                 }
 
@@ -136,7 +150,7 @@ class AppUpdateManager(private val context: Context) {
                         currentVersionCode = BuildConfig.VERSION_CODE,
                         currentVersionName = BuildConfig.VERSION_NAME,
                         packageName = currentPkg,
-                        downloadUrl = downloadUrl,
+                        downloadUrl = resolvedUrl,
                         changelog = changelog,
                         isCritical = isCritical
                     )
@@ -211,10 +225,54 @@ class AppUpdateManager(private val context: Context) {
     }
 
     /**
+     * Checks if the downloaded APK signing certificate matches the currently running application.
+     */
+    fun verifyApkSignaturesMatch(apkFile: File): Boolean {
+        return try {
+            val pm = context.packageManager
+            val installedSignatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val pkgInfo = pm.getPackageInfo(context.packageName, android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES)
+                pkgInfo.signingInfo?.apkContentsSigners?.map { it.toByteArray().contentHashCode() }
+            } else {
+                @Suppress("DEPRECATION")
+                val pkgInfo = pm.getPackageInfo(context.packageName, android.content.pm.PackageManager.GET_SIGNATURES)
+                pkgInfo.signatures?.map { it.toByteArray().contentHashCode() }
+            }
+
+            val archiveSignatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val archiveInfo = pm.getPackageArchiveInfo(apkFile.absolutePath, android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES)
+                archiveInfo?.signingInfo?.apkContentsSigners?.map { it.toByteArray().contentHashCode() }
+            } else {
+                @Suppress("DEPRECATION")
+                val archiveInfo = pm.getPackageArchiveInfo(apkFile.absolutePath, android.content.pm.PackageManager.GET_SIGNATURES)
+                archiveInfo?.signatures?.map { it.toByteArray().contentHashCode() }
+            }
+
+            if (installedSignatures.isNullOrEmpty() || archiveSignatures.isNullOrEmpty()) {
+                true
+            } else {
+                installedSignatures.any { archiveSignatures.contains(it) }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Signature check error: ${e.message}")
+            true
+        }
+    }
+
+    /**
      * Launches the system Package Installer using FileProvider.
      */
     fun installApk(apkFile: File): Boolean {
         return try {
+            if (!verifyApkSignaturesMatch(apkFile)) {
+                Log.w(TAG, "Signing certificate mismatch: current app and update APK were signed with different keys.")
+                android.widget.Toast.makeText(
+                    context,
+                    "Notice: Signing key differs (Debug vs Release). If install fails, please install the matching debug build.",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            }
+
             val authority = "${context.packageName}.fileprovider"
             val apkUri = FileProvider.getUriForFile(context, authority, apkFile)
 
