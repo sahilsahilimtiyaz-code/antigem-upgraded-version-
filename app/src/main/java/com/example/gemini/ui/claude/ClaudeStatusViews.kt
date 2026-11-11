@@ -35,6 +35,7 @@ fun ClaudeStatusPrompt(
     onRestartServer: () -> Unit,
     onRetry: () -> Unit,
     onServerLogs: () -> Unit,
+    onImport: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
     /** The local server is (re)starting: wait instead of reporting it offline. */
     serverStarting: Boolean = false
@@ -67,10 +68,11 @@ fun ClaudeStatusPrompt(
         ClaudeStatus.NOT_INSTALLED -> AgentSetupPrompt(
             AgentKind.CLAUDE,
             "Claude Code not found",
-            "The claude CLI is not installed on this device yet. You can install it from Settings in one tap.",
+            "The claude CLI is not installed on this device yet. You can install it or import a downloaded archive (.tar.gz, .zip).",
             modifier, dot,
             actionLabel = "Set up Claude Code", onAction = onSetup,
-            secondaryLabel = "Check again", onSecondary = onRetry
+            secondaryLabel = if (onImport != null) "Import Agent" else "Check again",
+            onSecondary = onImport ?: onRetry
         )
         ClaudeStatus.BRIDGE_OUTDATED -> AgentSetupPrompt(
             AgentKind.CLAUDE,

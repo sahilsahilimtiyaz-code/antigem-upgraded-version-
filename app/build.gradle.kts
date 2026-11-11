@@ -256,6 +256,16 @@ val buildAgyIdeBridge = tasks.register<Exec>("buildAgyIdeBridge") {
   inputs.dir(bridgeSourceDir)
   outputs.file(rawFile)
 
+  val goBin = listOf(
+    File(rootProject.projectDir, ".tools/go/bin/go").absolutePath,
+    "/usr/local/go/bin/go",
+    "/usr/bin/go"
+  ).firstOrNull { File(it).exists() } ?: (if (System.getenv("PATH")?.split(":")?.any { File(it, "go").exists() } == true) "go" else null)
+
+  onlyIf {
+    goBin != null
+  }
+
   doFirst {
     rawFile.parentFile.mkdirs()
   }
@@ -270,12 +280,7 @@ val buildAgyIdeBridge = tasks.register<Exec>("buildAgyIdeBridge") {
   environment("GOOS", "linux")
   environment("GOARCH", "arm64")
   environment("CGO_ENABLED", "0")
-  val goBin = listOf(
-    File(rootProject.projectDir, ".tools/go/bin/go").absolutePath,
-    "/usr/local/go/bin/go",
-    "/usr/local/bin/go"
-  ).firstOrNull { File(it).exists() } ?: "go"
-  commandLine(goBin, "build", "-ldflags=-s -w", "-o", rawFile.absolutePath, "main.go")
+  commandLine(goBin ?: "go", "build", "-ldflags=-s -w", "-o", rawFile.absolutePath, "main.go")
 }
 
 val compressAgyIdeBridge = tasks.register<Exec>("compressAgyIdeBridge") {
@@ -285,6 +290,10 @@ val compressAgyIdeBridge = tasks.register<Exec>("compressAgyIdeBridge") {
 
   inputs.file(rawFile)
   outputs.file(agyIdeBridgeXzFile)
+
+  onlyIf {
+    rawFile.exists() && rawFile.length() > 0L
+  }
 
   doFirst {
     binDir.mkdirs()

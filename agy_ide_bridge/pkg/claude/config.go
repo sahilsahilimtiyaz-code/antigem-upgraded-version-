@@ -490,6 +490,53 @@ func (m *Manager) handleCLIJob(w http.ResponseWriter, r *http.Request, action st
 			return
 		}
 	}
+	if action == "import" {
+		var inputReader io.Reader
+		var inputName string
+		file, header, err := r.FormFile("file")
+		if err == nil {
+			defer file.Close()
+			inputReader = file
+			inputName = header.Filename
+		} else {
+			var body struct {
+				Path string `json:"path"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.Path != "" {
+				lf, err := os.Open(body.Path)
+				if err != nil {
+					writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "error": err.Error()})
+					return
+				}
+				defer lf.Close()
+				inputReader = lf
+				inputName = filepath.Base(body.Path)
+			}
+		}
+		if inputReader == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "error": "no file or path provided"})
+			return
+		}
+		nj := &cliJob{Kind: action, Running: true, Started: time.Now()}
+		m.jobMu.Lock()
+		m.job = nj
+		m.jobMu.Unlock()
+		go func() {
+			code := 0
+			if err := m.importNativeArchive(inputReader, inputName, nj); err != nil {
+				fmt.Fprintf(nj, "Error: %v\n", err)
+				code = 1
+			}
+			nj.mu.Lock()
+			nj.Running = false
+			nj.ExitCode = &code
+			nj.mu.Unlock()
+			m.invalidateCaches()
+		}()
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "job": nj.snapshot()})
+		return
+	}
 	if config.IsAndroid() && (action == "install" || action == "update") {
 		// Termux: the official binary needs glibc, so it is downloaded like install.sh does and started by the
 		// app's wrapper (see native_install.go)

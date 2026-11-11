@@ -210,3 +210,79 @@ func versionLess(a, b string) bool {
 	}
 	return len(pa) < len(pb)
 }
+
+// importNativeArchive installs a Claude Code binary or archive into ~/.local/share/claude/versions/<version>.
+func (m *Manager) importNativeArchive(r io.Reader, filename string, log io.Writer) error {
+	dir := m.nativeVersionsDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmpArchive, err := os.CreateTemp(dir, ".claude-import-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmpArchive.Name())
+
+	fmt.Fprintln(log, "Buffering imported package…")
+	if _, err := io.Copy(tmpArchive, r); err != nil {
+		return fmt.Errorf("failed to write archive: %w", err)
+	}
+	_ = tmpArchive.Close()
+
+	// Determine version
+	version := "1.0.0"
+	vMatch := regexp.MustCompile(`([0-9]+\.[0-9]+\.[0-9]+)`).FindStringSubmatch(filename)
+	if len(vMatch) > 1 {
+		version = vMatch[1]
+	}
+
+	target := filepath.Join(dir, version)
+	tmpTarget := filepath.Join(dir, "."+version+".import")
+	defer os.Remove(tmpTarget)
+
+	f, err := os.Open(tmpArchive.Name())
+	if err != nil {
+		return err
+	}
+	header := make([]byte, 512)
+	n, _ := f.Read(header)
+	f.Close()
+
+	if n >= 4 && header[0] == 0x7f && header[1] == 'E' && header[2] == 'L' && header[3] == 'F' {
+		fmt.Fprintln(log, "Detected raw ELF binary. Installing…")
+		if err := copyFile(tmpArchive.Name(), tmpTarget, 0o755); err != nil {
+			return err
+		}
+	} else {
+		fmt.Fprintln(log, "Installing imported agent binary…")
+		if err := copyFile(tmpArchive.Name(), tmpTarget, 0o755); err != nil {
+			return err
+		}
+	}
+
+	if err := os.Rename(tmpTarget, target); err != nil {
+		_ = os.Remove(target)
+		if err := os.Rename(tmpTarget, target); err != nil {
+			return err
+		}
+	}
+	_ = os.Chmod(target, 0o755)
+	fmt.Fprintf(log, "Successfully imported Claude Code %s!\n", version)
+	m.pruneNativeVersions(log)
+	return nil
+}
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
+}

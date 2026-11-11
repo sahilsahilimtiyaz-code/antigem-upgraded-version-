@@ -356,4 +356,38 @@ class ClaudeConfigManager(
                 .onFailure { _messages.tryEmit("$action failed: ${it.message}") }
         }
     }
+
+    /**
+     * Imports a downloaded Claude Code archive (.tar.gz, .tgz, .zip, or raw ELF binary) from device storage.
+     */
+    fun importAgentArchive(context: android.content.Context, uri: android.net.Uri) {
+        val jobLog = StringBuilder()
+        val initialJob = ClaudeCliJob(
+            kind = "import",
+            running = true,
+            exit_code = null,
+            log = "Starting Claude Code agent import…\n"
+        )
+        _cliJob.value = initialJob
+        scope.launch {
+            val result = ClaudeImporter.importFromUri(context, uri) { step ->
+                jobLog.append(step).append("\n")
+                _cliJob.value = initialJob.copy(log = jobLog.toString())
+            }
+            result
+                .onSuccess { res ->
+                    jobLog.append("\nSuccessfully imported Claude Code ${res.version}!\nTarget: ${res.targetPath} (${res.binarySize / (1024 * 1024)} MB)\n")
+                    _cliJob.value = initialJob.copy(running = false, exit_code = 0, log = jobLog.toString())
+                    _messages.tryEmit("Claude Code ${res.version} imported successfully!")
+                    onCliChanged()
+                }
+                .onFailure { err ->
+                    val msg = err.message ?: "Import failed"
+                    jobLog.append("\nError importing agent: ").append(msg).append("\n")
+                    _cliJob.value = initialJob.copy(running = false, exit_code = 1, log = jobLog.toString())
+                    _messages.tryEmit("Agent import failed: $msg")
+                }
+        }
+    }
 }
+

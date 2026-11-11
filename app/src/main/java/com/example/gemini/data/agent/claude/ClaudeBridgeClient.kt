@@ -209,6 +209,10 @@ class ClaudeBridgeClient(
     /** action: install | update */
     suspend fun startCliJob(action: String): Result<ClaudeCliJobResponse> = post("/cli/$action")
 
+    /** Imports a binary/archive at the given path on the bridge's filesystem */
+    suspend fun importCliPath(path: String): Result<ClaudeCliJobResponse> =
+        post("/cli/import", """{"path":${ClaudeJson.encodeToString(path)}}""")
+
     /** Dictation relay: send 16 kHz mono s16le PCM as binary frames; transcript frames come back as text. */
     fun openVoice(language: String, listener: WebSocketListener): WebSocket {
         val httpUrl = url("/voice").toHttpUrl().newBuilder().addQueryParameter("language", language).build()

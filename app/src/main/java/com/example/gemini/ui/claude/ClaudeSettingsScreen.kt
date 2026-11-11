@@ -2,7 +2,11 @@ package com.example.gemini.ui.claude
 
 import com.example.gemini.ui.components.bouncyVerticalScroll
 import android.widget.Toast
+import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.BorderStroke
@@ -230,6 +234,10 @@ private fun AccountPage(deps: ClaudeSettingsDeps) {
     val job by deps.config.cliJob.collectAsState()
     val state by deps.account.state.collectAsState()
     var showLogin by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        uri?.let { deps.config.importAgentArchive(context, it) }
+    }
 
     LaunchedEffect(Unit) {
         deps.account.refreshStatus()
@@ -254,7 +262,7 @@ private fun AccountPage(deps: ClaudeSettingsDeps) {
             }
         }
         Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             val running = job?.running == true
             if (state == ClaudeStatus.NOT_INSTALLED) {
                 Button(onClick = { deps.config.startCliJob("install") }, enabled = !running,
@@ -262,7 +270,15 @@ private fun AccountPage(deps: ClaudeSettingsDeps) {
             } else if (status?.installed == true) {
                 OutlinedButton(onClick = { deps.config.startCliJob("update") }, enabled = !running) { Text("Check for updates") }
             }
-            if (running) CircularProgressIndicator(Modifier.size(20.dp).align(Alignment.CenterVertically), strokeWidth = 2.dp)
+            OutlinedButton(
+                onClick = { importLauncher.launch("*/*") },
+                enabled = !running
+            ) {
+                Icon(Icons.Outlined.FileDownload, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Import Agent")
+            }
+            if (running) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
         }
         job?.let { j ->
             Spacer(Modifier.height(8.dp))

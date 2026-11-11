@@ -662,6 +662,25 @@ fun ChatScreen(
             viewModel.addAttachmentsFromUris(uris, context)
         }
     }
+
+    val claudeImportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch {
+                Toast.makeText(context, "Importing Claude Code archive…", Toast.LENGTH_SHORT).show()
+                val result = com.example.gemini.data.agent.claude.ClaudeImporter.importFromUri(context, uri)
+                result
+                    .onSuccess { res ->
+                        Toast.makeText(context, "Imported Claude Code ${res.version} successfully!", Toast.LENGTH_LONG).show()
+                        viewModel.claudeAccount.refreshStatus()
+                    }
+                    .onFailure { err ->
+                        Toast.makeText(context, "Import failed: ${err.message}", Toast.LENGTH_LONG).show()
+                    }
+            }
+        }
+    }
     var activeConversationKey by remember { mutableStateOf(currentConv?.id ?: "new") }
     // The keyboard edits this buffer directly (like a native EditText). Holding the text as a TextFieldValue here made
     // every key press round-trip through this screen; with long text that lagged and some keyboards (e.g. Samsung)
@@ -2012,6 +2031,7 @@ fun ChatScreen(
                                         onRestartServer = { com.example.gemini.data.local.LocalServerManager.restartServer(context) },
                                         onRetry = { viewModel.claudeAccount.refreshStatus() },
                                         onServerLogs = { showLocalServerOutputDialog = true },
+                                        onImport = { claudeImportLauncher.launch("*/*") },
                                         serverStarting = serverRestarting
                                     )
                                 } else if (isOpenCodeChat && openCodeState != com.example.gemini.data.agent.opencode.OpenCodeState.READY) {
