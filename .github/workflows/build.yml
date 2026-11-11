@@ -130,49 +130,21 @@ jobs:
           ./gradlew :app:compressAgyIdeBridge --no-configuration-cache
           ls -lh app/src/main/assets/bin/agy_ide_bridge.xz
 
-      - name: Build Debug APKs Sequentially (Termux, Standard, TermuxShared)
-        if: ${{ github.event.inputs.build_mode != 'release' }}
+      - name: Build Single Termux Debug APK
         run: |
           mkdir -p output
           ./gradlew :app:assembleTermuxDebug --max-workers=2 --no-configuration-cache
-          find app/build/outputs/apk/termux/debug -name "*.apk" -exec cp {} "output/antiGem-termux-v${{ steps.version.outputs.version_name }}-debug.apk" \;
-
-          ./gradlew :app:assembleStandardDebug --max-workers=2 --no-configuration-cache
-          find app/build/outputs/apk/standard/debug -name "*.apk" -exec cp {} "output/antiGem-standard-v${{ steps.version.outputs.version_name }}-debug.apk" \;
-
-          ./gradlew :app:assembleTermuxSharedDebug --max-workers=2 --no-configuration-cache
-          find app/build/outputs/apk/termuxShared/debug -name "*.apk" -exec cp {} "output/antiGem-termux-shared-v${{ steps.version.outputs.version_name }}-debug.apk" \;
-
-      - name: Build Release APKs Sequentially (Termux, Standard, TermuxShared)
-        if: ${{ github.event.inputs.build_mode != 'debug' }}
-        run: |
-          mkdir -p output
-          ./gradlew :app:assembleTermuxRelease --max-workers=2 --no-configuration-cache
-          find app/build/outputs/apk/termux/release -name "*.apk" -exec cp {} "output/antiGem-termux-v${{ steps.version.outputs.version_name }}-release.apk" \;
-
-          ./gradlew :app:assembleStandardRelease --max-workers=2 --no-configuration-cache
-          find app/build/outputs/apk/standard/release -name "*.apk" -exec cp {} "output/antiGem-standard-v${{ steps.version.outputs.version_name }}-release.apk" \;
-
-          ./gradlew :app:assembleTermuxSharedRelease --max-workers=2 --no-configuration-cache
-          find app/build/outputs/apk/termuxShared/release -name "*.apk" -exec cp {} "output/antiGem-termux-shared-v${{ steps.version.outputs.version_name }}-release.apk" \;
-
-      - name: Copy Bridge Binary & Generate SHA-256 Checksums
-        run: |
-          mkdir -p output
-          if [ -f "app/build/intermediates/agyIdeBridge/agy_ide_bridge" ]; then
-            cp "app/build/intermediates/agyIdeBridge/agy_ide_bridge" "output/agy_ide_bridge-v${{ steps.version.outputs.version_name }}-android-arm64"
-          fi
+          find app/build/outputs/apk/termux/debug -name "*.apk" -exec cp {} "output/antiGem-v${{ steps.version.outputs.version_name }}-debug.apk" \;
           cd output
-          sha256sum *.apk agy_ide_bridge* > SHA256SUMS.txt 2>/dev/null || true
+          sha256sum *.apk > SHA256SUMS.txt 2>/dev/null || true
           ls -lh
 
-      - name: Upload Built APKs as GitHub Actions Artifact
+      - name: Upload Single Debug APK as GitHub Actions Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AntiGem-APKs-v${{ steps.version.outputs.version_name }}-${{ github.sha }}
+          name: AntiGem-Debug-APK-v${{ steps.version.outputs.version_name }}
           path: |
-            output/*.apk
-            output/agy_ide_bridge*
+            output/antiGem-v${{ steps.version.outputs.version_name }}-debug.apk
             output/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30

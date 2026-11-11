@@ -34,6 +34,7 @@ import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
 import androidx.activity.compose.BackHandler
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
@@ -2080,20 +2081,91 @@ fun ChatScreen(
                                             onSecondary = { showLocalServerOutputDialog = true }
                                         )
                                     } else {
-                                        Text(
-                                            text = "How can I help you today?",
-                                            fontSize = 22.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = MaterialTheme.colorScheme.onSurface,
-                                            textAlign = TextAlign.Center
-                                        )
-                                        Spacer(modifier = Modifier.height(8.dp))
-                                        Text(
-                                            text = "Ask a question, brainstorm ideas, or start coding",
-                                            fontSize = 14.sp,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
-                                            textAlign = TextAlign.Center
-                                        )
+                                        val activeAgentKind = if (isClaudeChat) com.example.gemini.domain.model.AgentKind.CLAUDE
+                                            else if (isOpenCodeChat) com.example.gemini.domain.model.AgentKind.OPENCODE
+                                            else if (isCodexChat) com.example.gemini.domain.model.AgentKind.CODEX
+                                            else com.example.gemini.domain.model.AgentKind.AGY
+                                        val activeAccentColor = when (activeAgentKind) {
+                                            com.example.gemini.domain.model.AgentKind.CLAUDE -> ClaudeTerracotta
+                                            com.example.gemini.domain.model.AgentKind.OPENCODE -> GeminiBlue
+                                            com.example.gemini.domain.model.AgentKind.CODEX -> com.example.gemini.theme.AppColors.success
+                                            com.example.gemini.domain.model.AgentKind.AGY -> com.example.gemini.theme.AppColors.accentTeal
+                                        }
+
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(horizontal = 20.dp),
+                                            horizontalAlignment = Alignment.CenterHorizontally
+                                        ) {
+                                            com.example.gemini.ui.agents.AgentMark(
+                                                agent = activeAgentKind,
+                                                size = 64.dp,
+                                                statusColor = when (activeAgentKind) {
+                                                    com.example.gemini.domain.model.AgentKind.CLAUDE -> claudeEntry?.color
+                                                    com.example.gemini.domain.model.AgentKind.OPENCODE -> openCodeEntry?.color
+                                                    com.example.gemini.domain.model.AgentKind.CODEX -> codexEntry?.color
+                                                    com.example.gemini.domain.model.AgentKind.AGY -> agyEntry?.color
+                                                }
+                                            )
+                                            Spacer(modifier = Modifier.height(18.dp))
+                                            Text(
+                                                text = "How can I help you today?",
+                                                fontSize = 24.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                letterSpacing = (-0.3).sp,
+                                                color = MaterialTheme.colorScheme.onSurface,
+                                                textAlign = TextAlign.Center
+                                            )
+                                            Spacer(modifier = Modifier.height(6.dp))
+                                            Text(
+                                                text = "Explore codebases, run commands, create tools & write code",
+                                                fontSize = 13.5.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
+                                                textAlign = TextAlign.Center
+                                            )
+                                            Spacer(modifier = Modifier.height(24.dp))
+
+                                            // Quick interactive starter chips
+                                            val starterPrompts = listOf(
+                                                "⚡ Optimize app performance" to "Analyze the project for performance bottlenecks and provide optimization steps.",
+                                                "🐞 Review bugs & errors" to "Check recent logs and code changes for bugs or runtime errors.",
+                                                "✨ Build a new UI feature" to "Help me design a modern, stylish component with smooth animations.",
+                                                "📁 Explore project files" to "List and summarize the architecture of this project."
+                                            )
+                                            starterPrompts.forEach { (label, prompt) ->
+                                                Surface(
+                                                    onClick = {
+                                                        inputState.setTextAndPlaceCursorAtEnd(prompt)
+                                                    },
+                                                    shape = RoundedCornerShape(16.dp),
+                                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.16f)),
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(vertical = 4.dp)
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                                                        verticalAlignment = Alignment.CenterVertically
+                                                    ) {
+                                                        Text(
+                                                            text = label,
+                                                            fontSize = 13.5.sp,
+                                                            fontWeight = FontWeight.Medium,
+                                                            color = MaterialTheme.colorScheme.onSurface,
+                                                            modifier = Modifier.weight(1f)
+                                                        )
+                                                        Icon(
+                                                            imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+                                                            contentDescription = null,
+                                                            tint = activeAccentColor.copy(alpha = 0.8f),
+                                                            modifier = Modifier.size(16.dp)
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
