@@ -106,13 +106,18 @@ class AppUpdateManager(private val context: Context) {
                 currentPkg == "com.termux" -> "termux"
                 else -> "standard"
             }
-            val primaryBuildType = if (BuildConfig.DEBUG) "debug" else "release"
-            val candidateUrls = listOf(
-                "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-$flavorType-v$remoteVersionName-$primaryBuildType.apk",
-                "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-$flavorType-v$remoteVersionName-release.apk",
-                "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-$flavorType-v$remoteVersionName.apk",
-                "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-v$remoteVersionName.apk"
-            ).distinct()
+            val candidateUrls = if (BuildConfig.DEBUG) {
+                listOf(
+                    "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-$flavorType-v$remoteVersionName-debug.apk",
+                    "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-v$remoteVersionName-debug.apk"
+                )
+            } else {
+                listOf(
+                    "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-$flavorType-v$remoteVersionName-release.apk",
+                    "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-$flavorType-v$remoteVersionName.apk",
+                    "https://github.com/santoshkurmi/antigem/releases/download/v$remoteVersionName/antiGem-v$remoteVersionName.apk"
+                )
+            }.distinct()
 
             var resolvedUrl: String? = null
             if (remoteVersionCode > BuildConfig.VERSION_CODE) {
@@ -268,9 +273,10 @@ class AppUpdateManager(private val context: Context) {
                 Log.w(TAG, "Signing certificate mismatch: current app and update APK were signed with different keys.")
                 android.widget.Toast.makeText(
                     context,
-                    "Notice: Signing key differs (Debug vs Release). If install fails, please install the matching debug build.",
+                    "Cannot install update: The update APK signature does not match your installed build.",
                     android.widget.Toast.LENGTH_LONG
                 ).show()
+                return false
             }
 
             val authority = "${context.packageName}.fileprovider"

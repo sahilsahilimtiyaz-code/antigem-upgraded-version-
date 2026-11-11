@@ -165,67 +165,124 @@ func (m *Manager) install(ctx context.Context, j *installJob, update bool) error
 	}
 	j.logf("Downloading %s", meta.Dist.Tarball)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, meta.Dist.Tarball, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download: HTTP %d", resp.StatusCode)
-	}
 	if err := os.MkdirAll(m.installDir(), 0700); err != nil {
 		return err
 	}
-	tgz, err := os.CreateTemp(m.installDir(), ".download-*.tgz")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tgz.Name())
-	defer tgz.Close()
-	h := sha512.New()
+	tarballFile := filepath.Join(m.installDir(), ".download.tgz")
+	defer os.Remove(tarballFile)
+
 	var done int64
-	total := resp.ContentLength
-	buf := make([]byte, 256<<10)
-	lastReport := time.Now()
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := tgz.Write(buf[:n]); werr != nil {
-				return werr
+	total := int64(0)
+	const maxRetries = 5
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		downloaded := int64(0)
+		if fi, err := os.Stat(tarballFile); err == nil {
+			downloaded = fi.Size()
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, meta.Dist.Tarball, nil)
+		if err != nil {
+			return err
+		}
+		if downloaded > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", downloaded))
+			j.logf("Resuming download from %d MB (attempt %d/%d)…", downloaded>>20, attempt, maxRetries)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			if attempt == maxRetries {
+				return fmt.Errorf("download failed after %d attempts: %w", maxRetries, err)
 			}
-			h.Write(buf[:n])
-			done += int64(n)
-			if time.Since(lastReport) > 2*time.Second {
-				lastReport = time.Now()
-				if total > 0 {
-					j.logf("  %d / %d MB", done>>20, total>>20)
-				} else {
-					j.logf("  %d MB", done>>20)
+			j.logf("Network drop (%v), retrying in 3s…", err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		var tgz *os.File
+		if resp.StatusCode == http.StatusPartialContent && downloaded > 0 {
+			tgz, err = os.OpenFile(tarballFile, os.O_APPEND|os.O_WRONLY, 0600)
+			if total == 0 && resp.ContentLength > 0 {
+				total = downloaded + resp.ContentLength
+			}
+		} else if resp.StatusCode == http.StatusOK {
+			tgz, err = os.OpenFile(tarballFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+			downloaded = 0
+			total = resp.ContentLength
+		} else {
+			resp.Body.Close()
+			if attempt == maxRetries {
+				return fmt.Errorf("download: HTTP %d", resp.StatusCode)
+			}
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		if err != nil {
+			resp.Body.Close()
+			return err
+		}
+
+		done = downloaded
+		buf := make([]byte, 256<<10)
+		lastReport := time.Now()
+		var readErr error
+		for {
+			n, rerr := resp.Body.Read(buf)
+			if n > 0 {
+				if _, werr := tgz.Write(buf[:n]); werr != nil {
+					readErr = werr
+					break
+				}
+				done += int64(n)
+				if time.Since(lastReport) > 2*time.Second {
+					lastReport = time.Now()
+					if total > 0 {
+						j.logf("  %d / %d MB (%d%%)", done>>20, total>>20, (done*100)/total)
+					} else {
+						j.logf("  %d MB", done>>20)
+					}
 				}
 			}
+			if rerr != nil {
+				if rerr != io.EOF {
+					readErr = rerr
+				}
+				break
+			}
 		}
-		if rerr == io.EOF {
+		resp.Body.Close()
+		_ = tgz.Close()
+
+		if readErr == nil {
 			break
 		}
-		if rerr != nil {
-			return fmt.Errorf("download: %w", rerr)
-		}
+		j.logf("Connection glitch (%v). Resuming…", readErr)
+		time.Sleep(3 * time.Second)
 	}
 	j.logf("Downloaded %d MB", done>>20)
 	if want := meta.Dist.Integrity; strings.HasPrefix(want, "sha512-") {
+		f, err := os.Open(tarballFile)
+		if err != nil {
+			return err
+		}
+		h := sha512.New()
+		if _, err := io.Copy(h, f); err != nil {
+			f.Close()
+			return err
+		}
+		f.Close()
 		if got := "sha512-" + base64.StdEncoding.EncodeToString(h.Sum(nil)); got != want {
 			return errors.New("the download does not match the registry's checksum")
 		}
 		j.logf("Checksum OK")
 	}
 
-	if _, err := tgz.Seek(0, io.SeekStart); err != nil {
+	tgz, err := os.Open(tarballFile)
+	if err != nil {
 		return err
 	}
+	defer tgz.Close()
 	gz, err := gzip.NewReader(tgz)
 	if err != nil {
 		return err
@@ -281,7 +338,120 @@ func (m *Manager) install(ctx context.Context, j *installJob, update bool) error
 	return nil
 }
 
-// handleInstall: GET /api/opencode/cli/job; POST /api/opencode/cli/{install|update}.
+// importArchive installs an imported OpenCode binary or archive.
+func (m *Manager) importArchive(r io.Reader, filename string, j *installJob) error {
+	if err := os.MkdirAll(m.installDir(), 0700); err != nil {
+		return err
+	}
+	tmpFile, err := os.CreateTemp(m.installDir(), ".import-*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmpFile.Name())
+	j.logf("Buffering imported OpenCode package…")
+	if _, err := io.Copy(tmpFile, r); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to save archive: %w", err)
+	}
+	_ = tmpFile.Close()
+
+	dest := filepath.Join(m.installDir(), "opencode")
+	tmpDest := dest + ".new"
+	defer os.Remove(tmpDest)
+
+	f, err := os.Open(tmpFile.Name())
+	if err != nil {
+		return err
+	}
+	header := make([]byte, 512)
+	n, _ := f.Read(header)
+	f.Close()
+
+	if n >= 4 && header[0] == 0x7f && header[1] == 'E' && header[2] == 'L' && header[3] == 'F' {
+		j.logf("Detected raw OpenCode ELF executable. Installing…")
+		if err := copyFile(tmpFile.Name(), tmpDest, 0755); err != nil {
+			return err
+		}
+	} else {
+		j.logf("Extracting archive…")
+		in, err := os.Open(tmpFile.Name())
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		gz, err := gzip.NewReader(in)
+		if err != nil {
+			return fmt.Errorf("archive format error: %w", err)
+		}
+		defer gz.Close()
+		tr := tar.NewReader(gz)
+		found := false
+		for {
+			hdr, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			if hdr.Name == "package/bin/opencode" || filepath.Base(hdr.Name) == "opencode" {
+				outFile, err := os.OpenFile(tmpDest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0755)
+				if err != nil {
+					return err
+				}
+				if _, err := io.Copy(outFile, tr); err != nil {
+					outFile.Close()
+					return err
+				}
+				outFile.Close()
+				found = true
+				break
+			}
+		}
+		if !found {
+			return errors.New("archive did not contain an opencode binary")
+		}
+	}
+
+	if err := os.Rename(tmpDest, dest); err != nil {
+		_ = os.Remove(dest)
+		if err := os.Rename(tmpDest, dest); err != nil {
+			return err
+		}
+	}
+	_ = os.Chmod(dest, 0755)
+
+	m.verMu.Lock()
+	m.version = ""
+	m.verMu.Unlock()
+	v := m.Version(dest)
+	if v == "" {
+		v = "latest"
+	}
+	j.logf("Successfully installed OpenCode %s at %s", v, dest)
+	if m.Running() {
+		j.logf("Restarting OpenCode server…")
+		m.Stop()
+	}
+	return nil
+}
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
+}
+
+// handleInstall: GET /api/opencode/cli/job; POST /api/opencode/cli/{install|update|import}.
 func (m *Manager) handleInstall(w http.ResponseWriter, r *http.Request, action string) {
 	m.jobMu.Lock()
 	job := m.job
@@ -294,7 +464,7 @@ func (m *Manager) handleInstall(w http.ResponseWriter, r *http.Request, action s
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "job": snap})
 		return
 	}
-	if action != "install" && action != "update" {
+	if action != "install" && action != "update" && action != "import" {
 		writeJSON(w, http.StatusNotFound, map[string]interface{}{"success": false, "error": "unknown cli action"})
 		return
 	}
@@ -311,6 +481,24 @@ func (m *Manager) handleInstall(w http.ResponseWriter, r *http.Request, action s
 	m.jobMu.Lock()
 	m.job = nj
 	m.jobMu.Unlock()
+
+	if action == "import" {
+		go func() {
+			defer r.Body.Close()
+			code := 0
+			if err := m.importArchive(r.Body, "opencode_archive", nj); err != nil {
+				nj.logf("Error: %v", err)
+				code = 1
+			}
+			nj.mu.Lock()
+			nj.Running = false
+			nj.ExitCode = &code
+			nj.mu.Unlock()
+		}()
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "job": nj.snapshot()})
+		return
+	}
+
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 		defer cancel()

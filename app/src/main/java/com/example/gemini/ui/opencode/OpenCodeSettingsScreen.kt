@@ -21,10 +21,16 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import android.net.Uri
+import android.util.Log
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.Dns
+import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.Hub
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Delete
@@ -32,6 +38,8 @@ import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.ui.platform.LocalContext
+import com.example.gemini.data.agent.opencode.OpenCodeImporter
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -178,6 +186,30 @@ fun OpenCodeSettingsScreen(
         loading = false
     }
 
+    val context = LocalContext.current
+    var isImporting by remember { mutableStateOf(false) }
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch {
+                isImporting = true
+                Toast.makeText(context, "Importing OpenCode package…", Toast.LENGTH_SHORT).show()
+                val result = OpenCodeImporter.importFromUri(context, uri) { progress ->
+                    Log.d("OpenCodeSettings", progress)
+                }
+                isImporting = false
+                result.fold(
+                    onSuccess = { info ->
+                        Toast.makeText(context, "OpenCode ${info.version} successfully imported!", Toast.LENGTH_LONG).show()
+                        reload()
+                    },
+                    onFailure = { err ->
+                        Toast.makeText(context, "Import failed: ${err.message}", Toast.LENGTH_LONG).show()
+                    }
+                )
+            }
+        }
+    }
+
     LaunchedEffect(Unit) {
         backend.refreshCliJob()
         reload()
@@ -225,16 +257,26 @@ fun OpenCodeSettingsScreen(
                     if (state == OpenCodeState.NOT_INSTALLED) {
                         Button(
                             onClick = { backend.startCliJob("install") },
-                            enabled = !jobRunning,
+                            enabled = !jobRunning && !isImporting,
                             shape = RoundedCornerShape(12.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = OpenCodeAccent, contentColor = Color.White)
                         ) { Text(if (jobRunning) "Installing…" else "Install OpenCode") }
                     } else {
-                        OutlinedButton(onClick = { backend.startCliJob("update") }, enabled = !jobRunning, shape = RoundedCornerShape(12.dp)) {
+                        OutlinedButton(onClick = { backend.startCliJob("update") }, enabled = !jobRunning && !isImporting, shape = RoundedCornerShape(12.dp)) {
                             Text(if (jobRunning) "Checking…" else "Check for updates")
                         }
                     }
-                    if (jobRunning) {
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(
+                        onClick = { importLauncher.launch("*/*") },
+                        enabled = !jobRunning && !isImporting,
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(Icons.Outlined.FileDownload, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (isImporting) "Importing…" else "Import Agent")
+                    }
+                    if (jobRunning || isImporting) {
                         Spacer(Modifier.width(10.dp))
                         CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = OpenCodeAccent)
                     }

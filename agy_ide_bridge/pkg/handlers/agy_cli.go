@@ -260,74 +260,129 @@ func (h *Handler) installAgyNative(ctx context.Context, job *agyCliJob, destPath
 	job.logf("Latest version: %s", manifest.Version)
 	job.logf("Downloading %s", manifest.URL)
 
-	dlReq, err := http.NewRequestWithContext(ctx, http.MethodGet, manifest.URL, nil)
-	if err != nil {
-		return "", err
-	}
-	dlResp, err := http.DefaultClient.Do(dlReq)
-	if err != nil {
-		return "", fmt.Errorf("downloading Antigravity CLI: %w", err)
-	}
-	defer dlResp.Body.Close()
-	if dlResp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download server returned HTTP %d", dlResp.StatusCode)
-	}
-
 	installDir := filepath.Dir(destPath)
 	if err := os.MkdirAll(installDir, 0o755); err != nil {
 		return "", fmt.Errorf("creating install folder %s: %w", installDir, err)
 	}
 
-	tgz, err := os.CreateTemp(installDir, ".agy-download-*.tar.gz")
-	if err != nil {
-		return "", fmt.Errorf("creating temp archive: %w", err)
-	}
-	defer os.Remove(tgz.Name())
-	defer tgz.Close()
+	tgzFile := filepath.Join(installDir, ".agy-download.tar.gz")
+	defer os.Remove(tgzFile)
 
-	hasher := sha512.New()
 	var done int64
-	total := dlResp.ContentLength
-	buf := make([]byte, 256<<10)
-	lastReport := time.Now()
-	for {
-		n, rerr := dlResp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := tgz.Write(buf[:n]); werr != nil {
-				return "", werr
+	total := int64(0)
+	const maxRetries = 5
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		downloaded := int64(0)
+		if fi, err := os.Stat(tgzFile); err == nil {
+			downloaded = fi.Size()
+		}
+
+		dlReq, err := http.NewRequestWithContext(ctx, http.MethodGet, manifest.URL, nil)
+		if err != nil {
+			return "", err
+		}
+		if downloaded > 0 {
+			dlReq.Header.Set("Range", fmt.Sprintf("bytes=%d-", downloaded))
+			job.logf("Resuming agy download from %d MB (attempt %d/%d)…", downloaded>>20, attempt, maxRetries)
+		}
+
+		dlResp, err := http.DefaultClient.Do(dlReq)
+		if err != nil {
+			if attempt == maxRetries {
+				return "", fmt.Errorf("downloading Antigravity CLI after %d attempts: %w", maxRetries, err)
 			}
-			hasher.Write(buf[:n])
-			done += int64(n)
-			if time.Since(lastReport) >= 1500*time.Millisecond {
-				lastReport = time.Now()
-				if total > 0 {
-					pct := int((done * 100) / total)
-					job.logf("  %d / %d MB (%d%%)", done>>20, total>>20, pct)
-				} else {
-					job.logf("  %d MB", done>>20)
+			job.logf("Network glitch (%v), retrying in 3s…", err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		var tgz *os.File
+		if dlResp.StatusCode == http.StatusPartialContent && downloaded > 0 {
+			tgz, err = os.OpenFile(tgzFile, os.O_APPEND|os.O_WRONLY, 0600)
+			if total == 0 && dlResp.ContentLength > 0 {
+				total = downloaded + dlResp.ContentLength
+			}
+		} else if dlResp.StatusCode == http.StatusOK {
+			tgz, err = os.OpenFile(tgzFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+			downloaded = 0
+			total = dlResp.ContentLength
+		} else {
+			dlResp.Body.Close()
+			if attempt == maxRetries {
+				return "", fmt.Errorf("download server returned HTTP %d", dlResp.StatusCode)
+			}
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		if err != nil {
+			dlResp.Body.Close()
+			return "", err
+		}
+
+		done = downloaded
+		buf := make([]byte, 256<<10)
+		lastReport := time.Now()
+		var readErr error
+		for {
+			n, rerr := dlResp.Body.Read(buf)
+			if n > 0 {
+				if _, werr := tgz.Write(buf[:n]); werr != nil {
+					readErr = werr
+					break
+				}
+				done += int64(n)
+				if time.Since(lastReport) >= 1500*time.Millisecond {
+					lastReport = time.Now()
+					if total > 0 {
+						pct := int((done * 100) / total)
+						job.logf("  %d / %d MB (%d%%)", done>>20, total>>20, pct)
+					} else {
+						job.logf("  %d MB", done>>20)
+					}
 				}
 			}
+			if rerr != nil {
+				if rerr != io.EOF {
+					readErr = rerr
+				}
+				break
+			}
 		}
-		if rerr == io.EOF {
+		dlResp.Body.Close()
+		_ = tgz.Close()
+
+		if readErr == nil {
 			break
 		}
-		if rerr != nil {
-			return "", fmt.Errorf("reading download stream: %w", rerr)
-		}
+		job.logf("Stream dropped (%v). Retrying…", readErr)
+		time.Sleep(3 * time.Second)
 	}
 	job.logf("Downloaded %d MB", done>>20)
 
 	if want := strings.ToLower(strings.TrimSpace(manifest.SHA512)); want != "" {
-		got := hex.EncodeToString(hasher.Sum(nil))
+		f, err := os.Open(tgzFile)
+		if err != nil {
+			return "", err
+		}
+		h := sha512.New()
+		if _, err := io.Copy(h, f); err != nil {
+			f.Close()
+			return "", err
+		}
+		f.Close()
+		got := hex.EncodeToString(h.Sum(nil))
 		if got != want {
 			return "", errors.New("SHA-512 checksum mismatch on downloaded archive")
 		}
 		job.logf("SHA-512 checksum verified.")
 	}
 
-	if _, err := tgz.Seek(0, io.SeekStart); err != nil {
-		return "", err
+	tgz, err := os.Open(tgzFile)
+	if err != nil {
+		return "", fmt.Errorf("opening downloaded archive: %w", err)
 	}
+	defer tgz.Close()
 	gz, err := gzip.NewReader(tgz)
 	if err != nil {
 		return "", fmt.Errorf("opening gzip archive: %w", err)

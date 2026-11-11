@@ -2283,6 +2283,8 @@ export RUSTFLAGS="-C codegen-units=2"
 export OMP_NUM_THREADS=2
 export MKL_NUM_THREADS=2
 export OPENBLAS_NUM_THREADS=2
+export GOMAXPROCS=2
+export NODE_OPTIONS="--max-old-space-size=1536"
 ulimit -n 8192 2>/dev/null || ulimit -n 4096 2>/dev/null
 ulimit -u 4096 2>/dev/null || ulimit -u 2048 2>/dev/null
 
@@ -2337,6 +2339,8 @@ export RUSTFLAGS="-C codegen-units=2"
 export OMP_NUM_THREADS=2
 export MKL_NUM_THREADS=2
 export OPENBLAS_NUM_THREADS=2
+export GOMAXPROCS=2
+export NODE_OPTIONS="--max-old-space-size=1536"
 ulimit -n 8192 2>/dev/null || ulimit -n 4096 2>/dev/null
 ulimit -u 4096 2>/dev/null || ulimit -u 2048 2>/dev/null
 """.trimIndent()

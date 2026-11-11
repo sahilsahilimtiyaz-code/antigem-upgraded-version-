@@ -133,31 +133,114 @@ func httpGet(client *http.Client, url string, limit int64) ([]byte, error) {
 }
 
 func downloadVerified(url, dest string, size int64, checksum string, log io.Writer) error {
-	client := &http.Client{Timeout: 60 * time.Minute}
-	resp, err := client.Get(url)
-	if err != nil {
-		return fmt.Errorf("download failed: %w", err)
+	client := &http.Client{Timeout: 10 * time.Minute}
+	const maxRetries = 5
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		var downloaded int64 = 0
+		if fi, err := os.Stat(dest); err == nil {
+			downloaded = fi.Size()
+		}
+		if size > 0 && downloaded >= size {
+			if verifySha256(dest, checksum) == nil {
+				return nil
+			}
+			_ = os.Remove(dest)
+			downloaded = 0
+		}
+
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		if downloaded > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", downloaded))
+			fmt.Fprintf(log, "Resuming download from %d MB (attempt %d/%d)…\n", downloaded>>20, attempt, maxRetries)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if attempt == maxRetries {
+				return fmt.Errorf("download failed after %d attempts: %w", maxRetries, err)
+			}
+			fmt.Fprintf(log, "Network interruption (%v), retrying in 3s…\n", err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		var f *os.File
+		if resp.StatusCode == http.StatusPartialContent && downloaded > 0 {
+			f, err = os.OpenFile(dest, os.O_APPEND|os.O_WRONLY, 0o600)
+		} else if resp.StatusCode == http.StatusOK {
+			f, err = os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+			downloaded = 0
+		} else {
+			resp.Body.Close()
+			if attempt == maxRetries {
+				return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
+			}
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		if err != nil {
+			resp.Body.Close()
+			return err
+		}
+
+		pw := &progressWriter{total: size, done: downloaded, log: log}
+		buf := make([]byte, 256*1024)
+		var readErr error
+		for {
+			n, rerr := resp.Body.Read(buf)
+			if n > 0 {
+				if _, werr := f.Write(buf[:n]); werr != nil {
+					readErr = werr
+					break
+				}
+				pw.Write(buf[:n])
+			}
+			if rerr != nil {
+				if rerr != io.EOF {
+					readErr = rerr
+				}
+				break
+			}
+		}
+		resp.Body.Close()
+		_ = f.Close()
+
+		if readErr == nil {
+			if err := verifySha256(dest, checksum); err != nil {
+				_ = os.Remove(dest)
+				if attempt == maxRetries {
+					return err
+				}
+				fmt.Fprintf(log, "Checksum check failed: %v. Retrying…\n", err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			return nil
+		}
+
+		fmt.Fprintf(log, "Stream dropped (%v). Retrying with resume…\n", readErr)
+		time.Sleep(3 * time.Second)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
-	}
-	f, err := os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	return fmt.Errorf("download failed after %d attempts", maxRetries)
+}
+
+func verifySha256(filePath, expected string) error {
+	f, err := os.Open(filePath)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 	h := sha256.New()
-	pw := &progressWriter{total: size, log: log}
-	_, copyErr := io.Copy(io.MultiWriter(f, h, pw), resp.Body)
-	closeErr := f.Close()
-	if copyErr != nil {
-		return fmt.Errorf("download failed: %w", copyErr)
+	if _, err := io.Copy(h, f); err != nil {
+		return err
 	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != checksum {
-		return fmt.Errorf("checksum mismatch (got %s, expected %s)", got, checksum)
+	got := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(got, expected) {
+		return fmt.Errorf("checksum mismatch (got %s, expected %s)", got, expected)
 	}
 	return nil
 }
